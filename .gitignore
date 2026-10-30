@@ -1,0 +1,7 @@
+.local/
+**/bin/
+**/obj/
+dist/
+**/__pycache__/
+*.pyc
+.vs/

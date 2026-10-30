@@ -1,0 +1,125 @@
+using System.Diagnostics;
+using System.Net.NetworkInformation;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Win32;
+using DsBridge.Core;
+
+namespace DsBridge.App;
+
+internal static class Paths {
+    public static string Root => AppContext.BaseDirectory;
+    public static string State => Path.Combine(Root, ".local");
+    public static string Sessions => Path.Combine(State, "sessions");
+    public static string Backend => Path.Combine(Root, "backend", "vdsd.exe");
+    public static string HideCli => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+        "Nefarius Software Solutions", "HidHide", "x64", "HidHideCLI.exe");
+    public static string Usbip => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "USBip", "usbip.exe");
+    public static bool Driver(string name) {
+        using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + name);
+        return key?.GetValue("Type") is not null;
+    }
+    public static bool Admin => new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator);
+    public static string CheckSession(string path) {
+        var full = Path.GetFullPath(path);
+        if (!full.StartsWith(Path.GetFullPath(Sessions) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("会话目录必须位于工具自己的 .local/sessions 内。");
+        return full;
+    }
+}
+internal static class Run {
+    public static ProcessStartInfo Info(string exe, params string[] args) {
+        var info = new ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardError = true, RedirectStandardOutput = true, WorkingDirectory = Paths.Root };
+        foreach (var arg in args) info.ArgumentList.Add(arg);
+        return info;
+    }
+    public static async Task<string> Text(string exe, string[] args, int timeout = 8000) {
+        using var proc = Process.Start(Info(exe, args)) ?? throw new InvalidOperationException("无法启动 " + Path.GetFileName(exe));
+        var stdout = proc.StandardOutput.ReadToEndAsync();
+        var stderr = proc.StandardError.ReadToEndAsync();
+        try { await proc.WaitForExitAsync().WaitAsync(TimeSpan.FromMilliseconds(timeout)); }
+        catch { try { proc.Kill(); } catch {} throw new TimeoutException(Path.GetFileName(exe) + " 响应超时"); }
+        var output = await stdout; var error = await stderr;
+        if (proc.ExitCode != 0) throw new InvalidOperationException(Path.GetFileName(exe) + " 失败: " + error + output);
+        return output;
+    }
+    public static bool IsAlive(int pid, long ticks) {
+        try { using var p = Process.GetProcessById(pid); return !p.HasExited && p.StartTime.ToUniversalTime().Ticks == ticks; }
+        catch { return false; }
+    }
+}
+internal sealed class HidHide : IHideAccess {
+    private async Task<string> Cmd(params string[] args) {
+        for(int attempt=0;;attempt++) {
+            try { return await Run.Text(Paths.HideCli,args); }
+            // HidHide's control handle is exclusive. Its own configuration utility or a
+            // concurrent read-only diagnostic can briefly hold it; retry only open-denied.
+            catch(InvalidOperationException ex) when(attempt<4 &&
+                ex.Message.Contains("0x0005",StringComparison.OrdinalIgnoreCase)) {
+                await Task.Delay(125*(attempt+1));
+            }
+        }
+    }
+    public async Task<HideState> Read() {
+        // Separate calls make parser errors explicit; never infer missing output as "off".
+        var active = HideParser.Flag(await Cmd("--cloak-state"), "cloak");
+        var inverse = HideParser.Flag(await Cmd("--inv-state"), "inv");
+        var devices = HideParser.Entries(await Cmd("--dev-list"), "--dev-hide");
+        var applications = HideParser.Entries(await Cmd("--app-list"), "--app-reg");
+        return new(active, inverse, devices, applications);
+    }
+    public async Task Register(string path) => _ = await Cmd("--app-reg", path);
+    public async Task Unregister(string path) => _ = await Cmd("--app-unreg", path);
+    public async Task Hide(string instance) => _ = await Cmd("--dev-hide", instance);
+    public async Task Unhide(string instance) => _ = await Cmd("--dev-unhide", instance);
+    public async Task SetActive(bool active) => _ = await Cmd(active ? "--cloak-on" : "--cloak-off");
+}
+internal sealed record ProbeReport(DateTimeOffset CheckedAt, string Windows, bool Admin, bool BackendReady,
+    bool HidHideInstalled, bool UsbipInstalled, Controller[] Controllers, string[] AudioOutputs,
+    string[] Blockers, string[] Notes);
+internal static class Probe {
+    public static async Task<ProbeReport> Read() {
+        var blockers = new List<string>(); var notes = new List<string>();
+        bool backend = false;
+        if (File.Exists(Paths.Backend)) {
+            try {
+                using var j = JsonDocument.Parse(await Run.Text(Paths.Backend, ["--bridge-info"]));
+                var r = j.RootElement;
+                backend = r.GetProperty("bridgeProtocol").GetInt32() == 1 &&
+                    r.GetProperty("managedHidHide").GetBoolean() && r.GetProperty("stopEvent").GetBoolean() &&
+                    r.GetProperty("exclusiveUsbip").GetBoolean();
+                if (!backend) blockers.Add("桥接后端缺少安全会话补丁。");
+            } catch (Exception ex) { blockers.Add("后端校验失败：" + ex.Message); }
+        } else blockers.Add("缺少已编译的 backend/vdsd.exe。");
+        bool hide = Paths.Driver("HidHide") && File.Exists(Paths.HideCli);
+        bool usbip = Paths.Driver("usbip2_ude") && Paths.Driver("usbip2_filter") && File.Exists(Paths.Usbip);
+        if (!hide) blockers.Add("未安装 HidHide；需单独确认后安装。");
+        if (!usbip) blockers.Add("未安装完整的 usbip-win2；需单独确认后安装。");
+        if (!Paths.Admin) notes.Add("查看和检查无需提权；实际启用桥接时会请求管理员权限。");
+        try {
+            if (IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners().Any(x => x.Port == 3240))
+                blockers.Add("本机 3240 端口已被占用，不能与其他 USB/IP 桥接并用。");
+        } catch (Exception ex) { blockers.Add("无法检查 USB/IP 端口：" + ex.Message); }
+        foreach (var name in new[] { "vdsd", "DS4Windows", "DSX", "DualSenseX", "DualSenseY", "DualSenseClient", "reWASD" }) {
+            var processes = Process.GetProcessesByName(name);
+            if (processes.Length != 0) blockers.Add("检测到 " + name + " 正在运行；请先在该软件内正常退出。");
+            foreach (var p in processes) p.Dispose();
+        }
+        using (var service = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\vdsd"))
+            if (service?.GetValue("Start") is int start && start == 2)
+                blockers.Add("已有 vDS 自动启动服务，可能接管手柄。请先处理原安装；本工具不会擅自修改它。");
+        Controller[] devices = [];
+        try { devices = Devices.Enumerate(); } catch (Exception ex) { blockers.Add("手柄枚举失败：" + ex.Message); }
+        if (!devices.Any(x => x.Transport == "蓝牙"))
+            blockers.Add("未检测到可读取的蓝牙 DualSense。完成普通蓝牙配对、拔掉数据线并唤醒手柄后再检查。");
+        string[] audio = [];
+        try { audio = Audio.Snapshot().Defaults.Where(x => x.Flow == 0).Select(x => x.Name).Distinct().ToArray(); }
+        catch (Exception ex) { blockers.Add("无法读取默认音频设备：" + ex.Message); }
+        notes.Add("《影之刃：零》尚未实机验收。优先比较同一场景的 USB 原生与蓝牙桥接效果。");
+        notes.Add("不安装驱动、不注册服务、不修改开机项；本次检查为只读。");
+        return new(DateTimeOffset.Now, Environment.OSVersion.VersionString, Paths.Admin, backend, hide, usbip, devices, audio, blockers.ToArray(), notes.ToArray());
+    }
+}

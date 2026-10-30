@@ -1,0 +1,61 @@
+{
+  "upstreamCommit": "ec531599dfdd02e14ce68efd8c0d2dcb439894a5",
+  "bridgeProtocol": 1,
+  "files": [
+    {
+      "path": "src/platform/win32/vdsd.cc",
+      "upstreamSha256": "448f864190421c1a5ecfdc293240541210313c254db2913c3c841d9b5980f468",
+      "patchedSha256": "be996ab47e4aa7a0d6d8d7826d6c5478af73f1aeccd102496d32685ad0ebf640"
+    },
+    {
+      "path": "src/platform/win32/vds_usbip.cc",
+      "upstreamSha256": "efd11f3a258843f338c486348b7aad339d28fbf08e9d1ca038360babbcc31eaa",
+      "patchedSha256": "15bff8b0f11d617cf418ada6e6e0e2716d7d04318286d579a5b19a448fa56e35"
+    },
+    {
+      "path": "src/platform/win32/vds_bt.cc",
+      "upstreamSha256": "25bc3c10aef393bc09d6852081caa94abd786e32b07491b7f92ea54107b3fd01",
+      "patchedSha256": "439bf59e10b9b629fecffb5efbd2cab44b9bbc9d622761f1567a03826fe1b07b"
+    },
+    {
+      "path": "src/platform/win32/vds_bt.hh",
+      "upstreamSha256": "35e729d446845190e86509aa84040df949145722c21a1558b6f7360201aabbf0",
+      "patchedSha256": "ceb107835bb6ba813d65218197d2ffea9b49417fbb85b57b0b8dd31c129cfc64"
+    },
+    {
+      "path": "src/vds_log.hh",
+      "upstreamSha256": "94746f445d664f88ad138294d7c54d32159f4aab93905e530f7a2bc593d17a9b",
+      "patchedSha256": "369ff4eb5148a619e7f626f60df025a1e0a4f47aaff7c59d54087ed01f6e96f0"
+    },
+    {
+      "path": "src/vds_log.cc",
+      "upstreamSha256": "e451348fd8e1819b849864f462b7d71077813b1adfa3543a0f817c143b87897b",
+      "patchedSha256": "04e24db65cb07f9817c572c37c5dd1a4fa4dfb0acfbbf7716aa4f0b0f1ce3d62"
+    },
+    {
+      "path": "CMakeLists.txt",
+      "upstreamSha256": "28421a05f2d7a11d040319bab7b40043c1c903f850a40c532e3c1a68d93c1db2",
+      "patchedSha256": "7c9f07605a52daa716140ae0b4092ab64da96a74a038f0c742e81ab214c7486d"
+    },
+    {
+      "path": "src/bridge_runtime.hh",
+      "patchedSha256": "f4118ec4cbf5f5a61ce6d9d2e5af5d7dfb8ca7f9880666f62f3cea351c6087b0"
+    },
+    {
+      "path": "src/usbip_hid_queue.hh",
+      "patchedSha256": "7adb341c2a3c2faa85e0c96a8a6eb4b1749ca4a89f782e73da0a90b270e25d33"
+    },
+    {
+      "path": "src/diagnostic_worker.hh",
+      "patchedSha256": "4d33b4d5d9041663cc6191ce2c2e37cfdeb4dc9814e4ccfe22f10322af29745c"
+    },
+    {
+      "path": "src/dsbridge_runtime_tests.cc",
+      "patchedSha256": "7743796a7ce5261712957dca482bc3a51f1e9ae71141c278a4ec264e608ce8fe"
+    },
+    {
+      "path": "src/dsbridge_diagnostic_tests.cc",
+      "patchedSha256": "bb7c09860a6e9f175a617334773176b9388ffeb4ae6b1f331d015f468d8813c8"
+    }
+  ]
+}

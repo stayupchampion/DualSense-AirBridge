@@ -1,0 +1,1925 @@
+--- a/src/platform/win32/vdsd.cc
++++ b/src/platform/win32/vdsd.cc
+@@ -36,10 +36,10 @@
+ #include "unique_handle.hh"
+ #include "vds/ds5_protocol.h"
+ #include "vds_bt.hh"
++#include "bridge_runtime.hh"
+ #include "vds_build_info.hh"
+ #include "vds_common.hh"
+ #include "vds_config.hh"
+-#include "vds_hidhide.hh"
+ #include "vds_io.hh"
+ #include "vds_log.hh"
+ #include "vds_profile.hh"
+@@ -64,9 +64,9 @@
+     "HidHide is not installed or HidHideCLI.exe is unavailable";
+ constexpr DWORD kDeviceShareMode =
+     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+-constexpr std::size_t kMaxPendingAudioChunks = 64;
+-constexpr std::size_t kAudioPrimeChunks = 24;
+-constexpr std::size_t kAudioFreshQueueChunks = 48;
++constexpr std::size_t kMaxPendingAudioChunks = dsbridge::kMaxChunks;
++constexpr std::size_t kAudioPrimeChunks = dsbridge::kPrimeChunks;
++constexpr std::size_t kAudioFreshQueueChunks = dsbridge::kMaxChunks;
+ constexpr std::size_t kAudioLowWatermarkChunks = 0;
+ constexpr std::size_t kAudioHighWatermarkChunks = 44;
+ constexpr std::size_t kWindowsPcmWindowFrames = vds::kPcmWindowFrames;
+@@ -76,7 +76,7 @@
+     (static_cast<std::int64_t>(kWindowsPcmWindowFrames) * 1000000 +
+      VDS_AUDIO_SAMPLE_RATE / 2) /
+     VDS_AUDIO_SAMPLE_RATE);
+-constexpr auto kAudioJitterBufferMaxDelay = std::chrono::milliseconds(300);
++constexpr auto kAudioJitterBufferMaxDelay = dsbridge::kPrimeTimeout;
+ constexpr auto kAudioUnderflowKeepaliveDelay = std::chrono::milliseconds(25);
+ constexpr auto kAudioLowWatermarkPaceDelay = std::chrono::microseconds(0);
+ constexpr auto kAudioHighWatermarkCatchupDelay = std::chrono::microseconds(0);
+@@ -137,7 +137,8 @@
+ struct Options {
+   std::string db_path;
+   std::string log_path;
+-  std::string pipe = kDefaultControlPipe;
++  std::string pipe;
++  std::string stop_event;
+ };
+ 
+ class TimerResolutionGuard {
+@@ -315,7 +316,9 @@
+   vds::MicAudioDecoder mic_decoder;
+   vds::HapticsPacketBuilder haptics_builder;
+   vds::AudioChunk silent_audio_chunk = make_silent_audio_chunk();
+-  std::deque<vds::AudioChunk> pending_audio_chunks;
++  dsbridge::TimedQueue<vds::AudioChunk> pending_audio_chunks;
++  std::int64_t audio_queue_age_last_us = 0;
++  std::int64_t audio_queue_age_max_us = 0;
+   std::optional<vds::AudioChunk> last_audio_chunk;
+   std::array<std::vector<std::uint8_t>, 256> feature_cache;
+   std::array<bool, 256> feature_cached{};
+@@ -408,9 +411,9 @@
+ 
+ Options parse_platform_args(int argc, char **argv) {
+   Options options;
+-  vds::VdsdCommonOptions common = vds::default_vdsd_common_options();
++  vds::VdsdCommonOptions common{};
+   const std::string platform_options =
+-      std::string("[--pipe ") + kDefaultControlPipe + "]";
++      "--pipe <private-pipe> --stop-event <Local\\event>";
+   const auto next_value = [&](int &index, std::string_view option) {
+     if (index + 1 >= argc) {
+       throw std::runtime_error(std::string(option) + " requires a value");
+@@ -428,12 +431,21 @@
+       }
+     } else if (arg == "--pipe") {
+       options.pipe = next_value(i, arg);
++    } else if (arg == "--stop-event") {
++      options.stop_event = next_value(i, arg);
+     } else {
+       throw std::runtime_error("unknown option: " + std::string(arg));
+     }
+   }
+   options.db_path = common.db_path;
+   options.log_path = common.log_path;
++  if (options.db_path.empty() || options.log_path.empty() ||
++      options.pipe.rfind(R"(\\.\pipe\)", 0) != 0 ||
++      options.pipe == kDefaultControlPipe ||
++      options.stop_event.rfind(R"(Local\)", 0) != 0 ||
++      options.stop_event.size() < 12) {
++    throw std::runtime_error("managed backend requires explicit --db-path, --log, a private --pipe, and --stop-event Local\\<unique-name>");
++  }
+   return options;
+ }
+ 
+@@ -750,7 +762,7 @@
+                           std::atomic_bool &bridge_restart_requested) {
+   if (frame.header.type == VDS_FRAME_USB_INTERFACE) {
+     if (frame.payload.size() != sizeof(vds_usb_interface_event)) {
+-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
++      logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Warn,
+                  "malformed USB interface frame length=" +
+                      std::to_string(frame.payload.size()));
+       return;
+@@ -811,7 +823,7 @@
+           state.audio_queue_drained_time = {};
+         }
+       }
+-      logger.log(vds::LogScope::Output, vds::LogLevel::Info,
++      logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Info,
+                  "audio out interface altsetting=" +
+                      std::to_string(event.altsetting));
+       if (event.altsetting != 0) {
+@@ -844,13 +856,13 @@
+                                 bluetooth_mutex, "mic state");
+       const bool sent = try_send_bt_output_report(bluetooth, report, logger,
+                                                   bluetooth_mutex, "mic");
+-      logger.log(
++      logger.log_diagnostic(
+           vds::LogScope::InputAudio, vds::LogLevel::Info,
+           "mic " + std::string(active ? "open" : "close") +
+               " sent=" + std::string(sent ? "yes" : "no") +
+               " interface_altsetting=" + std::to_string(event.altsetting));
+       if (active_audio_in_release) {
+-        logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
++        logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Info,
+                    "audio in endpoint released");
+       }
+     }
+@@ -874,7 +886,7 @@
+     if (!frame.payload.empty()) {
+       message += " report_id=" + std::to_string(frame.payload[0]);
+     }
+-    logger.log(vds::LogScope::Usb, vds::LogLevel::Info, message);
++    logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Info, message);
+     if (applied) {
+       send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
+     }
+@@ -890,7 +902,7 @@
+       vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_FEATURE_REPLY,
+                                    *cached, "virtual",
+                                    handle_io_cancellation());
+-      logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
++      logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Info,
+                  "feature get report_id=" + std::to_string(report_id) +
+                      " cache=hit bluetooth_forward=no");
+       return;
+@@ -908,12 +920,12 @@
+                                      VDS_FRAME_USB_FEATURE_REPLY, *report,
+                                      "virtual", handle_io_cancellation());
+       }
+-      logger.log(
++      logger.log_diagnostic(
+           vds::LogScope::Usb, vds::LogLevel::Info,
+           "feature get report_id=" + std::to_string(report_id) +
+               " cache=miss bluetooth_forward=" + (report ? "yes" : "no"));
+     } catch (const std::exception &error) {
+-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
++      logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Warn,
+                  "feature get report_id=" + std::to_string(report_id) +
+                      " failed: " + error.what());
+     }
+@@ -926,9 +938,9 @@
+     if (!frame.payload.empty()) {
+       message += " report_id=" + std::to_string(frame.payload[0]);
+     }
+-    logger.log(vds::LogScope::Usb, vds::LogLevel::Info, message);
++    logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Info, message);
+     if (frame.payload.empty() || frame.payload[0] == 0) {
+-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
++      logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Warn,
+                  "ignoring malformed feature set report");
+       return;
+     }
+@@ -953,7 +965,7 @@
+         test_result[2] = command_action;
+         test_result[3] = kTestCommandCompleteStatus;
+         cache_feature_report(state, test_result);
+-        logger.log(
++        logger.log_diagnostic(
+             vds::LogScope::Usb, vds::LogLevel::Info,
+             "WebHID test command device=" + std::to_string(command_device) +
+                 " action=" + std::to_string(command_action));
+@@ -1000,7 +1012,7 @@
+           }
+         }
+         if (!waveout_message.empty()) {
+-          logger.log(vds::LogScope::Output, vds::LogLevel::Info,
++          logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Info,
+                      waveout_message);
+         }
+         if (update_bt_state) {
+@@ -1010,7 +1022,7 @@
+     }
+ 
+     if (synthetic_test_command) {
+-      logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
++      logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Info,
+                  "feature set report_id=" + std::to_string(report_id) +
+                      " bluetooth_forward=no reason=synthetic_webhid_test");
+       return;
+@@ -1019,11 +1031,11 @@
+     try {
+       std::lock_guard guard(bluetooth_mutex);
+       bluetooth.write_feature_report(frame.payload);
+-      logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
++      logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Info,
+                  "feature set report_id=" + std::to_string(report_id) +
+                      " bluetooth_forward=yes");
+     } catch (const std::exception &error) {
+-      logger.log(vds::LogScope::Usb, vds::LogLevel::Warn,
++      logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Warn,
+                  "feature set report_id=" + std::to_string(report_id) +
+                      " failed: " + error.what());
+     }
+@@ -1049,6 +1061,7 @@
+   bool underflow_refilled = false;
+   bool log_dropped_summary = false;
+   bool audio_pcm_stream_started = false;
++  Clock::duration extract_duration{};
+   const auto extract_start = Clock::now();
+   std::vector<vds::AudioChunk> chunks;
+   {
+@@ -1098,7 +1111,7 @@
+       audio_route_activated = true;
+     }
+     chunks = state.extractor.push_usb_audio(frame.payload);
+-    const auto extract_duration = Clock::now() - extract_start;
++    extract_duration = Clock::now() - extract_start;
+     if (!chunks.empty() && !state.audio_pcm_stream_active) {
+       state.audio_pcm_stream_active = true;
+       state.audio_stream_had_pcm = true;
+@@ -1186,36 +1199,37 @@
+         dropped_chunks > 0 &&
+         (dropped_total == dropped_chunks || dropped_total % 1000 == 0);
+ 
+-    if (queued_chunks > 0 &&
+-        (audio_frame_count == 1 || audio_pcm_stream_started ||
+-         haptics_nonzero_first_seen || log_dropped_summary)) {
+-      logger.log(vds::LogScope::Output, vds::LogLevel::Info,
+-                 "audio out frame=" + std::to_string(audio_frame_count) +
+-                     " bytes=" + std::to_string(frame.payload.size()) +
+-                     " chunks=" + std::to_string(queued_chunks) +
+-                     " pending=" + std::to_string(pending_chunks) +
+-                     " dropped_total=" + std::to_string(dropped_total) +
+-                     " peak_ch0=" + std::to_string(peaks[0]) +
+-                     " peak_ch1=" + std::to_string(peaks[1]) +
+-                     " peak_ch2=" + std::to_string(peaks[2]) +
+-                     " peak_ch3=" + std::to_string(peaks[3]) + " extract_us=" +
+-                     std::to_string(duration_us(extract_duration)) +
+-                     " total_us=" +
+-                     std::to_string(duration_us(Clock::now() - audio_start)) +
+-                     " pcm_stream_started=" +
+-                     (audio_pcm_stream_started ? "yes" : "no"));
+-    }
++  }
++
++  if (queued_chunks > 0 &&
++      (audio_frame_count == 1 || audio_pcm_stream_started ||
++       haptics_nonzero_first_seen || log_dropped_summary)) {
++    logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Info,
++               "audio out frame=" + std::to_string(audio_frame_count) +
++                   " bytes=" + std::to_string(frame.payload.size()) +
++                   " chunks=" + std::to_string(queued_chunks) +
++                   " pending=" + std::to_string(pending_chunks) +
++                   " dropped_total=" + std::to_string(dropped_total) +
++                   " peak_ch0=" + std::to_string(peaks[0]) +
++                   " peak_ch1=" + std::to_string(peaks[1]) +
++                   " peak_ch2=" + std::to_string(peaks[2]) +
++                   " peak_ch3=" + std::to_string(peaks[3]) + " extract_us=" +
++                   std::to_string(duration_us(extract_duration)) +
++                   " total_us=" +
++                   std::to_string(duration_us(Clock::now() - audio_start)) +
++                   " pcm_stream_started=" +
++                   (audio_pcm_stream_started ? "yes" : "no"));
+   }
+ 
+   if (log_dropped_summary) {
+-    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
++    logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Warn,
+                "dropped BT 0x36 audio packets dropped=" +
+                    std::to_string(dropped_chunks) +
+                    " total=" + std::to_string(dropped_total) +
+                    " pending=" + std::to_string(pending_chunks));
+   }
+   if (underflow_refilled) {
+-    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
++    logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Warn,
+                "audio packet queue refilled after underflow refill_count=" +
+                    std::to_string(underflow_refill_count) + " gap_us=" +
+                    std::to_string(duration_us(underflow_refill_gap)) +
+@@ -1224,7 +1238,7 @@
+   }
+   if (audio_route_activated) {
+     (void)bluetooth.take_output_diagnostics(true);
+-    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
++    logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Info,
+                "audio out stream auto-activated by PCM frame");
+     send_bt_state_if_changed(bluetooth, state, logger, bluetooth_mutex);
+   }
+@@ -1259,7 +1273,7 @@
+ 
+       if (decode_failed) {
+         if (input_audio_trace) {
+-          logger.log(vds::LogScope::InputAudio, vds::LogLevel::Warn,
++          logger.log_diagnostic(vds::LogScope::InputAudio, vds::LogLevel::Warn,
+                      "mic packet decode failed");
+         }
+         return;
+@@ -1295,7 +1309,7 @@
+           forwarded = ++state.mic_input_forward_count;
+         }
+         if (input_audio_trace && (forwarded == 1 || forwarded % 1000 == 0)) {
+-          logger.log(vds::LogScope::InputAudio, vds::LogLevel::Debug,
++          logger.log_diagnostic(vds::LogScope::InputAudio, vds::LogLevel::Debug,
+                      "mic forwarded count=" + std::to_string(forwarded) +
+                          " len=" + std::to_string(pcm->size()) +
+                          " peak_ch0=" + std::to_string(pcm_peaks[0]) +
+@@ -1371,7 +1385,7 @@
+         }
+       }
+       if (mic_mute_changed) {
+-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
++        logger.log_diagnostic(vds::LogScope::InputControl, vds::LogLevel::Info,
+                    "mic " + std::string(mic_muted ? "muted" : "unmuted"));
+       }
+       if (send_mic_state) {
+@@ -1387,12 +1401,12 @@
+                                   bluetooth_mutex, "mic");
+       }
+       if (headset_changed) {
+-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
++        logger.log_diagnostic(vds::LogScope::InputControl, vds::LogLevel::Info,
+                    "headset " +
+                        std::string(headset_plugged ? "plugged" : "unplugged"));
+       }
+       if (headset_mic_changed) {
+-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
++        logger.log_diagnostic(vds::LogScope::InputControl, vds::LogLevel::Info,
+                    "headset mic " + std::string(headset_mic_plugged
+                                                     ? "plugged"
+                                                     : "unplugged"));
+@@ -1410,14 +1424,14 @@
+         }
+         if (change_count == 1 ||
+             trace_enabled(trace_flags, kTraceInputControl)) {
+-          logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
++          logger.log_diagnostic(vds::LogScope::InputControl, vds::LogLevel::Info,
+                      "hid in changed count=" + std::to_string(change_count) +
+                          " forwarded=" + std::to_string(forward_count) + " " +
+                          input_report_summary(*report));
+         }
+       }
+       if (forward_count == 1 || forward_count % 1024 == 0) {
+-        logger.log(vds::LogScope::InputControl, vds::LogLevel::Info,
++        logger.log_diagnostic(vds::LogScope::InputControl, vds::LogLevel::Info,
+                    std::string("hid in forwarded count=") +
+                        std::to_string(forward_count));
+       }
+@@ -1429,7 +1443,7 @@
+     return;
+   }
+ 
+-  logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Info,
++  logger.log_diagnostic(vds::LogScope::Bluetooth, vds::LogLevel::Info,
+              "control rx length=" + std::to_string(frame.payload.size()) +
+                  " prefix=" + hex_bytes(frame.payload, 8, ':', false));
+   const auto report = bt_feature_to_usb_feature_reply(frame.payload);
+@@ -1437,7 +1451,7 @@
+     vds::win::write_handle_frame(virtual_device, VDS_FRAME_USB_FEATURE_REPLY,
+                                  *report, "virtual", handle_io_cancellation());
+     if (!report->empty()) {
+-      logger.log(vds::LogScope::Usb, vds::LogLevel::Info,
++      logger.log_diagnostic(vds::LogScope::Usb, vds::LogLevel::Info,
+                  "feature reply report_id=" + std::to_string((*report)[0]) +
+                      " length=" + std::to_string(report->size()));
+     }
+@@ -1504,6 +1518,21 @@
+                                           BridgeState &state,
+                                           vds::Logger &logger,
+                                           std::mutex &bluetooth_mutex) {
++  struct UnderflowSnapshot {
++    decltype(BridgeState::audio_blocked_count) audio_blocked_count{};
++    decltype(BridgeState::audio_dropped_count) audio_dropped_count{};
++    decltype(BridgeState::audio_keepalive_blocked_count) audio_keepalive_blocked_count{};
++    decltype(BridgeState::audio_keepalive_sent_count) audio_keepalive_sent_count{};
++    decltype(BridgeState::audio_queued_count) audio_queued_count{};
++    decltype(BridgeState::audio_send_gap_warn_count) audio_send_gap_warn_count{};
++    decltype(BridgeState::audio_send_max_gap) audio_send_max_gap{};
++    decltype(BridgeState::audio_sent_count) audio_sent_count{};
++    decltype(BridgeState::audio_stale_dropped_count) audio_stale_dropped_count{};
++    decltype(BridgeState::audio_underflow_count) audio_underflow_count{};
++    decltype(BridgeState::audio_usb_gap_warn_count) audio_usb_gap_warn_count{};
++    decltype(BridgeState::audio_usb_max_gap) audio_usb_max_gap{};
++  } underflow;
++  bool report_underflow = false;
+   vds::BtReport packet{};
+   std::size_t pending_after_pop = 0;
+   std::uint64_t sent_count = 0;
+@@ -1538,6 +1567,9 @@
+   {
+     std::lock_guard guard(state.mutex);
+     const auto now = Clock::now();
++    const auto expired = state.pending_audio_chunks.discard_expired(now);
++    state.audio_dropped_count += expired;
++    state.audio_stale_dropped_count += expired;
+     if (state.pending_audio_chunks.empty()) {
+       if (!state.audio_out_stream_active || !state.audio_pcm_stream_active) {
+         return kAudioFlushIdleSleep;
+@@ -1584,32 +1616,19 @@
+           state.audio_underflow_reported = true;
+           state.audio_queue_empty_reported = true;
+           state.audio_queue_drained_time = state.audio_queue_empty_since;
+-          logger.log(
+-              vds::LogScope::Output, vds::LogLevel::Warn,
+-              "audio packet queue underflow during active stream count=" +
+-                  std::to_string(state.audio_underflow_count) +
+-                  " queued=" + std::to_string(state.audio_queued_count) +
+-                  " sent=" + std::to_string(state.audio_sent_count) +
+-                  " keepalive_sent=" +
+-                  std::to_string(state.audio_keepalive_sent_count) +
+-                  " dropped=" + std::to_string(state.audio_dropped_count) +
+-                  " stale_dropped=" +
+-                  std::to_string(state.audio_stale_dropped_count) +
+-                  " blocked=" + std::to_string(state.audio_blocked_count) +
+-                  " keepalive_blocked=" +
+-                  std::to_string(state.audio_keepalive_blocked_count) +
+-                  " usb_max_gap_us=" +
+-                  std::to_string(duration_us(state.audio_usb_max_gap)) +
+-                  " usb_gap_warn=" +
+-                  std::to_string(state.audio_usb_gap_warn_count) +
+-                  " send_max_gap_us=" +
+-                  std::to_string(duration_us(state.audio_send_max_gap)) +
+-                  " send_gap_warn=" +
+-                  std::to_string(state.audio_send_gap_warn_count));
+-          if (auto diagnostics = bluetooth.take_output_diagnostics(true)) {
+-            logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
+-                       *diagnostics);
+-          }
++          report_underflow = true;
++    underflow.audio_blocked_count = state.audio_blocked_count;
++    underflow.audio_dropped_count = state.audio_dropped_count;
++    underflow.audio_keepalive_blocked_count = state.audio_keepalive_blocked_count;
++    underflow.audio_keepalive_sent_count = state.audio_keepalive_sent_count;
++    underflow.audio_queued_count = state.audio_queued_count;
++    underflow.audio_send_gap_warn_count = state.audio_send_gap_warn_count;
++    underflow.audio_send_max_gap = state.audio_send_max_gap;
++    underflow.audio_sent_count = state.audio_sent_count;
++    underflow.audio_stale_dropped_count = state.audio_stale_dropped_count;
++    underflow.audio_underflow_count = state.audio_underflow_count;
++    underflow.audio_usb_gap_warn_count = state.audio_usb_gap_warn_count;
++    underflow.audio_usb_max_gap = state.audio_usb_max_gap;
+         }
+         state.audio_pcm_stream_active = false;
+         if (!state.waveout_active) {
+@@ -1661,7 +1680,12 @@
+         ++state.audio_stale_dropped_count;
+         ++stale_dropped_now;
+       }
++      state.audio_queue_age_last_us =
++          duration_us(state.pending_audio_chunks.front_age(now));
++      state.audio_queue_age_max_us =
++          std::max(state.audio_queue_age_max_us, state.audio_queue_age_last_us);
+       const vds::AudioChunk chunk = state.pending_audio_chunks.front();
++      state.pending_audio_chunks.pop_front(); // Own this item before releasing the queue lock.
+       has_signal = chunk.has_signal;
+       has_haptics_signal = chunk.has_haptics_signal;
+       vds::HapticsChunk haptics = chunk.haptics;
+@@ -1687,12 +1711,41 @@
+     }
+   }
+ 
++  if (audio_route_deactivated && stream_stop_report) {
++    (void)try_send_bt_output_report(bluetooth, *stream_stop_report, logger,
++                                    bluetooth_mutex, "state");
++  }
++  if (report_underflow) {
++          logger.log_diagnostic(
++              vds::LogScope::Output, vds::LogLevel::Warn,
++              "audio packet queue underflow during active stream count=" +
++                  std::to_string(underflow.audio_underflow_count) +
++                  " queued=" + std::to_string(underflow.audio_queued_count) +
++                  " sent=" + std::to_string(underflow.audio_sent_count) +
++                  " keepalive_sent=" +
++                  std::to_string(underflow.audio_keepalive_sent_count) +
++                  " dropped=" + std::to_string(underflow.audio_dropped_count) +
++                  " stale_dropped=" +
++                  std::to_string(underflow.audio_stale_dropped_count) +
++                  " blocked=" + std::to_string(underflow.audio_blocked_count) +
++                  " keepalive_blocked=" +
++                  std::to_string(underflow.audio_keepalive_blocked_count) +
++                  " usb_max_gap_us=" +
++                  std::to_string(duration_us(underflow.audio_usb_max_gap)) +
++                  " usb_gap_warn=" +
++                  std::to_string(underflow.audio_usb_gap_warn_count) +
++                  " send_max_gap_us=" +
++                  std::to_string(duration_us(underflow.audio_send_max_gap)) +
++                  " send_gap_warn=" +
++                  std::to_string(underflow.audio_send_gap_warn_count));
++          if (auto diagnostics = bluetooth.take_output_diagnostics(true)) {
++            logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Warn,
++                       *diagnostics);
++          }
++  }
++
+   if (audio_route_deactivated) {
+-    if (stream_stop_report) {
+-      (void)try_send_bt_output_report(bluetooth, *stream_stop_report, logger,
+-                                      bluetooth_mutex, "state");
+-    }
+-    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
++    logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Info,
+                "audio out stream auto-deactivated after PCM drain");
+     return next_sleep;
+   }
+@@ -1705,10 +1758,6 @@
+     std::size_t pending_count = 0;
+     {
+       std::lock_guard guard(state.mutex);
+-      if (!sending_keepalive && !sending_concealment &&
+-          !state.pending_audio_chunks.empty()) {
+-        state.pending_audio_chunks.pop_front();
+-      }
+       if (sending_keepalive) {
+         ++state.audio_keepalive_blocked_count;
+       } else {
+@@ -1734,7 +1783,7 @@
+       stale_dropped_count = state.audio_stale_dropped_count;
+     }
+     if (blocked_count == 1 || (blocked_count % 1000) == 0) {
+-      logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
++      logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Warn,
+                  "dropped BT 0x36 audio packet after HID queue blocked count=" +
+                      std::to_string(blocked_count) +
+                      " pending=" + std::to_string(pending_count) +
+@@ -1746,10 +1795,6 @@
+ 
+   {
+     std::lock_guard guard(state.mutex);
+-    if (!sending_keepalive && !sending_concealment &&
+-        !state.pending_audio_chunks.empty()) {
+-      state.pending_audio_chunks.pop_front();
+-    }
+     pending_after_pop = state.pending_audio_chunks.size();
+     if (pending_after_pop == 0) {
+       state.audio_jitter_buffer_start = {};
+@@ -1853,7 +1898,7 @@
+     if (have_gap) {
+       message += " gap_us=" + std::to_string(duration_us(send_gap));
+     }
+-    logger.log(vds::LogScope::Output,
++    logger.log_diagnostic(vds::LogScope::Output,
+                delayed_send ? vds::LogLevel::Warn : vds::LogLevel::Info,
+                message);
+   }
+@@ -1862,6 +1907,37 @@
+ 
+ void maybe_log_audio_summary(BluetoothTransport &bluetooth, BridgeState &state,
+                              vds::Logger &logger) {
++  struct Snapshot {
++    decltype(BridgeState::audio_blocked_count) audio_blocked_count{};
++    decltype(BridgeState::audio_concealed_count) audio_concealed_count{};
++    decltype(BridgeState::audio_dropped_count) audio_dropped_count{};
++    decltype(BridgeState::audio_flush_max_gap) audio_flush_max_gap{};
++    decltype(BridgeState::audio_keepalive_sent_count) audio_keepalive_sent_count{};
++    decltype(BridgeState::audio_low_watermark_pace_count) audio_low_watermark_pace_count{};
++    decltype(BridgeState::audio_out_stream_active) audio_out_stream_active{};
++    decltype(BridgeState::audio_pcm_stream_active) audio_pcm_stream_active{};
++    decltype(BridgeState::audio_queue_age_last_us) audio_queue_age_last_us{};
++    decltype(BridgeState::audio_queue_age_max_us) audio_queue_age_max_us{};
++    decltype(BridgeState::audio_send_max_gap) audio_send_max_gap{};
++    decltype(BridgeState::audio_sent_count) audio_sent_count{};
++    decltype(BridgeState::audio_stale_dropped_count) audio_stale_dropped_count{};
++    decltype(BridgeState::audio_underflow_count) audio_underflow_count{};
++    decltype(BridgeState::audio_usb_frame_count) audio_usb_frame_count{};
++    decltype(BridgeState::audio_usb_max_gap) audio_usb_max_gap{};
++    std::size_t pending = 0;
++    Clock::duration interval{};
++    std::uint64_t usb_delta{};
++    std::uint64_t sent_delta{};
++    std::uint64_t concealed_delta{};
++    std::uint64_t keepalive_delta{};
++    std::uint64_t dropped_delta{};
++    std::uint64_t blocked_delta{};
++    std::uint64_t underflow_delta{};
++    std::uint64_t usb_gap_warn_delta{};
++    std::uint64_t send_gap_warn_delta{};
++    std::uint64_t flush_gap_warn_delta{};
++    std::uint64_t low_watermark_pace_delta{};
++  } snapshot;
+   std::string message;
+   bool warn = false;
+   {
+@@ -1913,38 +1989,35 @@
+     warn = dropped_delta != 0 || blocked_delta != 0 || underflow_delta != 0 ||
+            usb_gap_warn_delta != 0 || send_gap_warn_delta != 0 ||
+            flush_gap_warn_delta != 0;
+-    message =
+-        "audio summary interval_us=" + std::to_string(duration_us(interval)) +
+-        " active=" + (state.audio_out_stream_active ? "yes" : "no") +
+-        " pcm_active=" + (state.audio_pcm_stream_active ? "yes" : "no") +
+-        " pending=" + std::to_string(state.pending_audio_chunks.size()) +
+-        " usb_frames=" + std::to_string(state.audio_usb_frame_count) +
+-        " usb_delta=" + std::to_string(usb_delta) +
+-        " sent=" + std::to_string(state.audio_sent_count) +
+-        " sent_delta=" + std::to_string(sent_delta) +
+-        " concealed=" + std::to_string(state.audio_concealed_count) +
+-        " concealed_delta=" + std::to_string(concealed_delta) +
+-        " keepalive=" + std::to_string(state.audio_keepalive_sent_count) +
+-        " keepalive_delta=" + std::to_string(keepalive_delta) +
+-        " dropped=" + std::to_string(state.audio_dropped_count) +
+-        " dropped_delta=" + std::to_string(dropped_delta) +
+-        " stale_dropped=" + std::to_string(state.audio_stale_dropped_count) +
+-        " blocked=" + std::to_string(state.audio_blocked_count) +
+-        " blocked_delta=" + std::to_string(blocked_delta) +
+-        " underflow=" + std::to_string(state.audio_underflow_count) +
+-        " underflow_delta=" + std::to_string(underflow_delta) +
+-        " usb_max_gap_us=" +
+-        std::to_string(duration_us(state.audio_usb_max_gap)) +
+-        " send_max_gap_us=" +
+-        std::to_string(duration_us(state.audio_send_max_gap)) +
+-        " flush_max_gap_us=" +
+-        std::to_string(duration_us(state.audio_flush_max_gap)) +
+-        " gap_warn_delta_usb=" + std::to_string(usb_gap_warn_delta) +
+-        " gap_warn_delta_send=" + std::to_string(send_gap_warn_delta) +
+-        " gap_warn_delta_flush=" + std::to_string(flush_gap_warn_delta) +
+-        " low_watermark_pace=" +
+-        std::to_string(state.audio_low_watermark_pace_count) +
+-        " low_watermark_pace_delta=" + std::to_string(low_watermark_pace_delta);
++    snapshot.audio_blocked_count = state.audio_blocked_count;
++    snapshot.audio_concealed_count = state.audio_concealed_count;
++    snapshot.audio_dropped_count = state.audio_dropped_count;
++    snapshot.audio_flush_max_gap = state.audio_flush_max_gap;
++    snapshot.audio_keepalive_sent_count = state.audio_keepalive_sent_count;
++    snapshot.audio_low_watermark_pace_count = state.audio_low_watermark_pace_count;
++    snapshot.audio_out_stream_active = state.audio_out_stream_active;
++    snapshot.audio_pcm_stream_active = state.audio_pcm_stream_active;
++    snapshot.audio_queue_age_last_us = state.audio_queue_age_last_us;
++    snapshot.audio_queue_age_max_us = state.audio_queue_age_max_us;
++    snapshot.audio_send_max_gap = state.audio_send_max_gap;
++    snapshot.audio_sent_count = state.audio_sent_count;
++    snapshot.audio_stale_dropped_count = state.audio_stale_dropped_count;
++    snapshot.audio_underflow_count = state.audio_underflow_count;
++    snapshot.audio_usb_frame_count = state.audio_usb_frame_count;
++    snapshot.audio_usb_max_gap = state.audio_usb_max_gap;
++    snapshot.pending = state.pending_audio_chunks.size();
++    snapshot.interval = interval;
++    snapshot.usb_delta = usb_delta;
++    snapshot.sent_delta = sent_delta;
++    snapshot.concealed_delta = concealed_delta;
++    snapshot.keepalive_delta = keepalive_delta;
++    snapshot.dropped_delta = dropped_delta;
++    snapshot.blocked_delta = blocked_delta;
++    snapshot.underflow_delta = underflow_delta;
++    snapshot.usb_gap_warn_delta = usb_gap_warn_delta;
++    snapshot.send_gap_warn_delta = send_gap_warn_delta;
++    snapshot.flush_gap_warn_delta = flush_gap_warn_delta;
++    snapshot.low_watermark_pace_delta = low_watermark_pace_delta;
+ 
+     state.audio_last_summary_time = now;
+     state.audio_last_summary_usb_frame_count = state.audio_usb_frame_count;
+@@ -1965,10 +2038,46 @@
+         state.audio_low_watermark_pace_count;
+   }
+ 
+-  logger.log(vds::LogScope::Output,
++    message =
++        "audio summary interval_us=" + std::to_string(duration_us(snapshot.interval)) +
++        " active=" + (snapshot.audio_out_stream_active ? "yes" : "no") +
++        " pcm_active=" + (snapshot.audio_pcm_stream_active ? "yes" : "no") +
++        " pending=" + std::to_string(snapshot.pending) +
++        " queue_age_last_us=" + std::to_string(snapshot.audio_queue_age_last_us) +
++        " queue_age_max_us=" + std::to_string(snapshot.audio_queue_age_max_us) +
++        " queue_capacity_ms=128 max_queue_age_ms=100 prime_ms=32" +
++        " usb_frames=" + std::to_string(snapshot.audio_usb_frame_count) +
++        " usb_delta=" + std::to_string(snapshot.usb_delta) +
++        " sent=" + std::to_string(snapshot.audio_sent_count) +
++        " sent_delta=" + std::to_string(snapshot.sent_delta) +
++        " concealed=" + std::to_string(snapshot.audio_concealed_count) +
++        " concealed_delta=" + std::to_string(snapshot.concealed_delta) +
++        " keepalive=" + std::to_string(snapshot.audio_keepalive_sent_count) +
++        " keepalive_delta=" + std::to_string(snapshot.keepalive_delta) +
++        " dropped=" + std::to_string(snapshot.audio_dropped_count) +
++        " dropped_delta=" + std::to_string(snapshot.dropped_delta) +
++        " stale_dropped=" + std::to_string(snapshot.audio_stale_dropped_count) +
++        " blocked=" + std::to_string(snapshot.audio_blocked_count) +
++        " blocked_delta=" + std::to_string(snapshot.blocked_delta) +
++        " underflow=" + std::to_string(snapshot.audio_underflow_count) +
++        " underflow_delta=" + std::to_string(snapshot.underflow_delta) +
++        " usb_max_gap_us=" +
++        std::to_string(duration_us(snapshot.audio_usb_max_gap)) +
++        " send_max_gap_us=" +
++        std::to_string(duration_us(snapshot.audio_send_max_gap)) +
++        " flush_max_gap_us=" +
++        std::to_string(duration_us(snapshot.audio_flush_max_gap)) +
++        " gap_warn_delta_usb=" + std::to_string(snapshot.usb_gap_warn_delta) +
++        " gap_warn_delta_send=" + std::to_string(snapshot.send_gap_warn_delta) +
++        " gap_warn_delta_flush=" + std::to_string(snapshot.flush_gap_warn_delta) +
++        " low_watermark_pace=" +
++        std::to_string(snapshot.audio_low_watermark_pace_count) +
++        " low_watermark_pace_delta=" + std::to_string(snapshot.low_watermark_pace_delta);
++
++  logger.log_diagnostic(vds::LogScope::Output,
+              warn ? vds::LogLevel::Warn : vds::LogLevel::Info, message);
+   if (auto diagnostics = bluetooth.take_output_diagnostics(true)) {
+-    logger.log(vds::LogScope::Output,
++    logger.log_diagnostic(vds::LogScope::Output,
+                warn ? vds::LogLevel::Warn : vds::LogLevel::Info, *diagnostics);
+   }
+ }
+@@ -2039,7 +2148,8 @@
+                         const vds::ControllerConfig *selected_config,
+                         vds::Logger &logger,
+                         std::atomic_bool *session_stop_requested = nullptr,
+-                        const std::atomic_uint32_t *trace_flags = nullptr) {
++                        const std::atomic_uint32_t *trace_flags = nullptr,
++                        std::atomic_bool *ready = nullptr) {
+   if (selected_config == nullptr) {
+     throw std::runtime_error("Windows bridge session requires config");
+   }
+@@ -2056,8 +2166,7 @@
+     throw std::runtime_error("failed to open Bluetooth controller: " +
+                              discovery_error);
+   }
+-  std::unique_ptr<vds::win::hidhide::DeviceGuard> hidden_device =
+-      vds::win::hidhide::hide_device(device->instance_path, logger);
++  // DSBridge manager owns all HidHide state and rollback.
+   std::unique_ptr<BluetoothTransport> bluetooth =
+       make_hid_bluetooth_transport(device_address);
+   std::unique_ptr<vds::win::usbip::VirtualPort> virtual_port =
+@@ -2102,6 +2211,8 @@
+   logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+              "Windows bridge started virtual=" + virtual_device +
+                  " bluetooth=" + bluetooth->description());
++
++  if (ready != nullptr) { ready->store(true); }
+ 
+   std::thread to_bluetooth([&] {
+     try {
+@@ -2156,6 +2267,21 @@
+   if (stop_monitor.joinable()) {
+     stop_monitor.join();
+   }
++  // All producers have joined. A naturally exiting loop may have bypassed
++  // request_bridge_restart's cancellation once the restart flag was set.
++  bluetooth->cancel(); // Cancels this HID handle/writer only; no radio reset.
++  // Send final neutral reports only after the normal writer has joined.
++  try {
++    const auto neutral = dsbridge::neutral_output(state.output_state, state.headset_plugged);
++    bluetooth->write_shutdown_packet(hidp_output_packet(neutral));
++    const auto mic_close = state.output_state.build_bt_mic_report(false);
++    bluetooth->write_shutdown_packet(hidp_output_packet(mic_close));
++    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
++               "shutdown neutral reports written; microphone close written");
++  } catch (const std::exception &error) {
++    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
++               std::string("shutdown neutralization not confirmed: ") + error.what());
++  }
+ }
+ 
+ struct BridgeWorker {
+@@ -2168,6 +2294,7 @@
+   std::thread thread;
+   std::atomic_bool stop_requested = false;
+   std::atomic_bool done = false;
++  std::atomic_bool ready = false;
+ };
+ 
+ class ControlPipeServer {
+@@ -2285,8 +2412,8 @@
+   void thread_main() {
+     while (!stop_requested_) {
+       UniqueHandle pipe(CreateNamedPipeA(
+-          pipe_name_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+-          PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 4096, 4096,
++          pipe_name_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
++          PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 4096,
+           0, nullptr));
+       if (!pipe) {
+         logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
+@@ -2310,7 +2437,7 @@
+                         DWORD &bytes_transferred, std::string_view label) {
+     HANDLE wait_handles[2] = {overlapped.hEvent, stop_event_.get()};
+     const DWORD wait_result =
+-        WaitForMultipleObjects(2, wait_handles, FALSE, INFINITE);
++        WaitForMultipleObjects(2, wait_handles, FALSE, 5000);
+     if (wait_result == WAIT_OBJECT_0 + 1) {
+       CancelIoEx(pipe, &overlapped);
+       (void)GetOverlappedResult(pipe, &overlapped, &bytes_transferred, TRUE);
+@@ -2447,7 +2574,9 @@
+     }
+ 
+     const std::string reply = queue_command(*command);
+-    (void)write_reply(pipe, reply);
++    if (!reply.empty() && write_reply(pipe, reply)) {
++      (void)read_command(pipe);
++    }
+   }
+ 
+   vds::Logger &logger_;
+@@ -2474,8 +2603,8 @@
+   for (const auto &worker : workers) {
+     controller_statuses.push_back(vds::VdsdControlControllerStatus{
+         .address = worker->address,
+-        .connected = worker_is_connected(*worker),
+-        .path = worker_is_connected(*worker)
++        .connected = worker->ready.load() && worker_is_connected(*worker),
++        .path = worker->ready.load() && worker_is_connected(*worker)
+                     ? vds::win::usbip::endpoint_for_port(worker->port)
+                     : "",
+     });
+@@ -2517,6 +2646,7 @@
+                                   vds::Logger &logger,
+                                   std::atomic_bool &stop_requested,
+                                   std::atomic_bool &done,
++                                  std::atomic_bool &ready,
+                                   std::string &last_error,
+                                   const std::atomic_uint32_t &trace_flags) {
+   try {
+@@ -2526,7 +2656,7 @@
+     const std::string virtual_device =
+         vds::win::usbip::endpoint_for_port(config.ports[0]);
+     run_bridge_session(device_address, virtual_device, &config, logger,
+-                       &stop_requested, &trace_flags);
++                       &stop_requested, &trace_flags, &ready);
+     if (!g_stop_requested && !stop_requested.load()) {
+       last_error = "bridge session ended";
+       logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
+@@ -2541,6 +2671,7 @@
+                      ": " + error.what());
+     }
+   }
++  ready = false;
+   done = true;
+ }
+ 
+@@ -2640,15 +2771,14 @@
+         }
+         const std::vector<unsigned> enabled_ports = enabled_virtual_ports();
+         const bool virtual_port_provider_is_available =
+-            !enabled_ports.empty() && vds::win::usbip::client_available() &&
+-            vds::win::hidhide::provider_available();
++            !enabled_ports.empty() && vds::win::usbip::client_available();
+         if (!virtual_port_provider_is_available) {
+           if (!virtual_port_provider_warned) {
+             std::string detail;
+             if (!vds::win::usbip::client_available()) {
+               detail = kWindowsVirtualPortProviderUnavailable;
+             } else {
+-              detail = kWindowsHidHideProviderUnavailable;
++              detail = "no virtual ports enabled";
+             }
+             logger.log(vds::LogScope::Port, vds::LogLevel::Error,
+                        std::string(kVirtualPortProviderUnavailableReason) +
+@@ -2788,7 +2918,7 @@
+                                         &logger, worker_ptr, &trace_flags] {
+             run_configured_bridge_worker(worker_config, device_address, logger,
+                                          worker_ptr->stop_requested,
+-                                         worker_ptr->done,
++                                         worker_ptr->done, worker_ptr->ready,
+                                          worker_ptr->last_error, trace_flags);
+             SetEvent(worker_ptr->done_event.get());
+           });
+@@ -2941,6 +3071,20 @@
+                                win32_error_message(GetLastError()));
+     }
+     g_stop_event = stop_event.get();
++    UniqueHandle external_stop(OpenEventA(SYNCHRONIZE, FALSE, options.stop_event.c_str()));
++    if (!external_stop) {
++      throw std::runtime_error("manager stop event does not exist or is inaccessible");
++    }
++    std::jthread stop_watcher([external = external_stop.get(), internal = stop_event.get()](std::stop_token token) {
++      while (!token.stop_requested()) {
++        const DWORD status = WaitForSingleObject(external, 100);
++        if (status == WAIT_OBJECT_0 || status == WAIT_FAILED) {
++          g_stop_requested = true;
++          SetEvent(internal);
++          return;
++        }
++      }
++    });
+     if (!service_mode) {
+       SetConsoleCtrlHandler(console_handler, TRUE);
+     }
+@@ -2959,13 +3103,6 @@
+                        " detail=" + kWindowsVirtualPortProviderUnavailable);
+         throw std::runtime_error(kWindowsVirtualPortProviderUnavailable);
+       }
+-      if (!vds::win::hidhide::provider_available()) {
+-        logger.log(vds::LogScope::Bluetooth, vds::LogLevel::Error,
+-                   std::string(kVirtualPortProviderUnavailableReason) +
+-                       " detail=" + kWindowsHidHideProviderUnavailable);
+-        throw std::runtime_error(kWindowsHidHideProviderUnavailable);
+-      }
+-      vds::win::hidhide::register_daemon();
+       if (service_mode) {
+         update_service_status(SERVICE_RUNNING);
+         logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+@@ -3001,47 +3138,11 @@
+   }
+ }
+ 
+-void WINAPI service_main(DWORD argc, LPSTR *argv) {
+-  g_service_status_handle = RegisterServiceCtrlHandlerExA(
+-      kServiceName, service_control_handler, nullptr);
+-  if (g_service_status_handle == nullptr) {
+-    g_service_exit_code = GetLastError();
+-    return;
+-  }
+-
+-  update_service_status(SERVICE_START_PENDING, ERROR_SUCCESS, 5000);
+-  g_service_exit_code = static_cast<DWORD>(
+-      run_windows_daemon(static_cast<int>(argc), argv, true));
+-  update_service_status(SERVICE_STOPPED, g_service_exit_code == 0
+-                                             ? ERROR_SUCCESS
+-                                             : ERROR_SERVICE_SPECIFIC_ERROR);
+-}
+-
+-bool dispatch_service_if_needed() {
+-  SERVICE_TABLE_ENTRYA service_table[] = {
+-      {const_cast<LPSTR>(kServiceName), service_main},
+-      {nullptr, nullptr},
+-  };
+-  if (StartServiceCtrlDispatcherA(service_table)) {
+-    return true;
+-  }
+-
+-  const DWORD error = GetLastError();
+-  if (error == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
+-    return false;
+-  }
+-  throw std::runtime_error("failed to connect service dispatcher: " +
+-                           win32_error_message(error));
+-}
+-
++// DSBridge fork: no service dispatcher and no install/self-registration path.
+ int main(int argc, char **argv) {
+-  try {
+-    if (dispatch_service_if_needed()) {
+-      return static_cast<int>(g_service_exit_code);
+-    }
+-  } catch (const std::exception &error) {
+-    std::cerr << "error: " << error.what() << "\n";
+-    return 1;
++  if (argc == 2 && std::string_view(argv[1]) == "--bridge-info") {
++    std::cout << R"({"bridgeProtocol":1,"upstreamCommit":"ec531599dfdd02e14ce68efd8c0d2dcb439894a5","managedHidHide":true,"stopEvent":true,"exclusiveUsbip":true,"serviceMode":false})" << "\n";
++    return 0;
+   }
+   return run_windows_daemon(argc, argv, false);
+ }
+--- a/src/platform/win32/vds_usbip.cc
++++ b/src/platform/win32/vds_usbip.cc
+@@ -3,6 +3,7 @@
+ // Copyright (C) 2026 Antonio <bleader93@gmail.com>
+ 
+ #include "vds_usbip.hh"
++#include "usbip_hid_queue.hh"
+ 
+ #include <algorithm>
+ #include <array>
+@@ -654,19 +655,28 @@
+   std::thread pipe_reader_thread;
+   std::mutex demux_mutex;
+   std::condition_variable demux_cv;
+-  std::deque<Frame> hid_in_queue;
++  struct PendingHidRequest {
++    SOCKET client;
++    std::uint32_t seqnum;
++    std::int32_t length;
++    std::int32_t number_of_packets;
++  };
++  dsbridge::PendingHidQueue<PendingHidRequest, Frame> hid_requests;
++  bool hid_session_active = false;
+   std::deque<Frame> feature_reply_queue;
+   std::vector<std::uint8_t> mic_ring_buffer;
+   bool mic_primed = false;
+ 
+   void pipe_reader_loop();
+-  bool wait_for_hid_in_frame(Frame &out, DWORD timeout_ms);
++  void dispatch_hid_replies_locked();
+   bool wait_for_feature_reply(Frame &out, DWORD timeout_ms);
+   std::vector<std::uint8_t> take_mic_bytes(std::size_t count);
+ 
+   struct PacedReply {
+     SOCKET client;
+     std::vector<std::uint8_t> bytes;
++    std::optional<std::uint32_t> hid_seqnum;
++    std::uint64_t generation = 0;
+   };
+   std::thread iso_pacer_thread;
+   std::mutex pacer_mutex;
+@@ -676,6 +686,7 @@
+   std::chrono::steady_clock::time_point iso_out_next_due{};
+   std::chrono::steady_clock::time_point iso_in_next_due{};
+   std::mutex socket_send_mutex;
++  dsbridge::ReplyEpoch reply_epoch;
+   void iso_pacer_loop();
+ 
+   std::atomic<int> speaker_gain_q15{1 << 15};
+@@ -880,15 +891,19 @@
+     if (!listener.valid()) {
+       error = "failed to create USB/IP listener";
+     } else {
+-      const BOOL reuse = TRUE;
+-      setsockopt(listener.get(), SOL_SOCKET, SO_REUSEADDR,
+-                 reinterpret_cast<const char *>(&reuse), sizeof(reuse));
++      const BOOL exclusive = TRUE;
++      if (setsockopt(listener.get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
++                     reinterpret_cast<const char *>(&exclusive), sizeof(exclusive)) != 0) {
++        error = "failed to reserve exclusive USB/IP listener";
++      }
+ 
+       sockaddr_in address{};
+       address.sin_family = AF_INET;
+       address.sin_addr.s_addr = inet_addr("127.0.0.1");
+       address.sin_port = hton16(kDefaultPort);
+-      if (bind(listener.get(), reinterpret_cast<sockaddr *>(&address),
++      if (!error.empty()) {
++        // Do not continue without exclusive ownership of this endpoint.
++      } else if (bind(listener.get(), reinterpret_cast<sockaddr *>(&address),
+                sizeof(address)) != 0) {
+         error = "failed to bind USB/IP listener to 127.0.0.1:" +
+                 std::to_string(kDefaultPort) + ": " +
+@@ -916,6 +931,11 @@
+                            reinterpret_cast<sockaddr *>(&client_address),
+                            &client_address_size));
+       if (!client.valid()) {
++        continue;
++      }
++      const BOOL no_delay = TRUE;
++      if (setsockopt(client.get(), IPPROTO_TCP, TCP_NODELAY,
++                     reinterpret_cast<const char *>(&no_delay), sizeof(no_delay)) != 0) {
+         continue;
+       }
+       if (stop_requested.load()) {
+@@ -1036,7 +1056,9 @@
+       std::lock_guard<std::mutex> send_guard(socket_send_mutex);
+       // Failure just means the client went away; the session loop notices
+       // on its own recv path, nothing to do here.
+-      send_exact(reply.client, reply.bytes.data(), reply.bytes.size());
++      // Cleanup invalidates even already-dequeued replies under this lock.
++      if (reply_epoch.accepts(reply.generation) && reply.client == client_socket.load())
++        send_exact(reply.client, reply.bytes.data(), reply.bytes.size());
+     }
+     lk.lock();
+   }
+@@ -1060,6 +1082,8 @@
+ }
+ 
+ void VirtualPort::Impl::handle_import_session(SOCKET client) {
++  logger.log(LogScope::Usb, LogLevel::Info,
++             "USB/IP low-latency socket: TCP_NODELAY=on; contiguous replies; asynchronous HID input");
+   const ProfileDescriptors desc = descriptors_for_profile(profile);
+ 
+   OpCommonHeader reply{
+@@ -1090,9 +1114,31 @@
+     return;
+   }
+ 
++  {
++    std::lock_guard<std::mutex> guard(socket_send_mutex);
++    reply_epoch.activate();
++  }
+   attached = true;
++  {
++    std::lock_guard<std::mutex> guard(demux_mutex);
++    hid_requests.clear();
++    hid_session_active = true;
++  }
+   auto cleanup_connection = [this]() noexcept {
+     attached = false;
++    try {
++      // Same demux -> pacer lock order as dispatch; no late HID reply can
++      // be enqueued after this connection's reply queue is cleared.
++      std::lock_guard<std::mutex> guard(demux_mutex);
++      hid_session_active = false;
++      hid_requests.clear();
++    } catch (...) {
++    }
++    try {
++      std::lock_guard<std::mutex> guard(socket_send_mutex);
++      reply_epoch.invalidate();
++    } catch (...) {
++    }
+     try {
+       std::lock_guard<std::mutex> guard(pacer_mutex);
+       paced_replies.clear();
+@@ -1157,12 +1203,24 @@
+           ntoh32(static_cast<std::uint32_t>(cmd.number_of_packets)));
+ 
+       if (cmd.base.command == kCmdUnlink) {
+-        // Best-effort: acknowledge unlink without tracking in-flight URBs
+-        // individually. vDS's interrupt/iso endpoints are effectively
+-        // always-pending polling loops, so an unlink just means "stop
+-        // expecting a reply for that seqnum," which our per-request
+-        // synchronous handling already satisfies.
++        // CMD_UNLINK's target seqnum occupies the transfer_flags slot.
++        // Pending HID requests and unsent HID replies are cancellable. Once
++        // the sender owns a reply, completion wins and UNLINK returns zero.
++        const auto target_seqnum = cmd.transfer_flags;
++        bool cancelled_hid = false;
++        {
++          std::lock_guard<std::mutex> guard(demux_mutex);
++          cancelled_hid = hid_requests.cancel(target_seqnum);
++          std::lock_guard<std::mutex> paced_guard(pacer_mutex);
++          for (auto it = paced_replies.begin(); it != paced_replies.end();) {
++            if (it->second.client == client && it->second.hid_seqnum == target_seqnum) {
++              it = paced_replies.erase(it);
++              cancelled_hid = true;
++            } else ++it;
++          }
++        }
+         UsbipRetUnlink unlink_reply{};
++        unlink_reply.status = hton32(cancelled_hid ? static_cast<std::uint32_t>(-104) : 0);
+         unlink_reply.base.command = hton32(kRetUnlink);
+         unlink_reply.base.seqnum = hton32(cmd.base.seqnum);
+         {
+@@ -1292,12 +1350,10 @@
+     std::lock_guard<std::mutex> lk(demux_mutex);
+     switch (frame.header.type) {
+     case VDS_FRAME_USB_HID_IN:
+-      hid_in_queue.push_back(std::move(frame));
+-      // Bound the queue: if the HID_IN handler stalls (e.g. blocked on
+-      // something else) we want to drop stale reports, not build
+-      // unbounded latency.
+-      if (hid_in_queue.size() > 8)
+-        hid_in_queue.pop_front();
++      if (hid_session_active) {
++        hid_requests.report(std::move(frame));
++        dispatch_hid_replies_locked();
++      }
+       break;
+     case VDS_FRAME_USB_FEATURE_REPLY:
+       feature_reply_queue.push_back(std::move(frame));
+@@ -1323,18 +1379,30 @@
+   }
+ }
+ 
+-bool VirtualPort::Impl::wait_for_hid_in_frame(Frame &out, DWORD timeout_ms) {
+-  std::unique_lock<std::mutex> lk(demux_mutex);
+-  if (!demux_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [this] {
+-        return !hid_in_queue.empty() || stop_requested.load();
+-      })) {
+-    return false;
+-  }
+-  if (hid_in_queue.empty())
+-    return false;
+-  out = std::move(hid_in_queue.front());
+-  hid_in_queue.pop_front();
+-  return true;
++// Called only under demux_mutex. Queueing replies involves no socket IO.
++void VirtualPort::Impl::dispatch_hid_replies_locked() {
++  if (!hid_session_active || stop_requested.load()) return;
++  while (auto ready = hid_requests.take_ready()) {
++    const auto &[request, frame] = *ready;
++    const auto count = std::min(frame.payload.size(), static_cast<std::size_t>(request.length));
++    UsbipRetSubmit ret{};
++    ret.base.command = hton32(kRetSubmit);
++    ret.base.seqnum = hton32(request.seqnum);
++    ret.actual_length = hton32(static_cast<std::uint32_t>(count));
++    ret.number_of_packets = hton32(static_cast<std::uint32_t>(request.number_of_packets));
++    PacedReply reply{};
++    reply.generation = reply_epoch.current();
++    reply.client = request.client;
++    reply.hid_seqnum = request.seqnum;
++    reply.bytes.resize(sizeof(ret)+count);
++    std::memcpy(reply.bytes.data(), &ret, sizeof(ret));
++    if (count) std::memcpy(reply.bytes.data()+sizeof(ret), frame.payload.data(), count);
++    {
++      std::lock_guard<std::mutex> guard(pacer_mutex);
++      paced_replies.emplace(std::chrono::steady_clock::now(), std::move(reply));
++    }
++    pacer_cv.notify_all();
++  }
+ }
+ 
+ bool VirtualPort::Impl::wait_for_feature_reply(Frame &out, DWORD timeout_ms) {
+@@ -1572,11 +1640,12 @@
+       reply_data.resize(wLength);
+     }
+   } else if (cmd.base.ep == kEpHidIn && cmd.base.direction == kDirIn) {
+-    Frame frame;
+-    if (wait_for_hid_in_frame(frame, 50)) {
+-      reply_data = frame.payload;
+-    }
+-    ret.status = 0;
++    std::lock_guard<std::mutex> guard(demux_mutex);
++    if (!hid_session_active || cmd.number_of_packets > 0 ||
++        !hid_requests.submit({client, cmd.base.seqnum, cmd.transfer_buffer_length, cmd.number_of_packets}))
++      return false;
++    dispatch_hid_replies_locked();
++    return true; // Audio OUT can be received while HID IN awaits a report.
+   } else if (cmd.base.ep == kEpHidOut && cmd.base.direction == kDirOut) {
+     write_daemon_frame(pipe_server.get(), VDS_FRAME_USB_HID_OUT, out_data);
+     ret.status = 0;
+@@ -1705,6 +1774,7 @@
+                        cmd.number_of_packets > 0;
+   if (pace_out || pace_in) {
+     PacedReply paced{};
++    paced.generation = reply_epoch.current();
+     paced.client = client;
+     const std::size_t data_len = pace_in ? reply_data.size() : 0;
+     const std::size_t iso_len =
+@@ -1735,25 +1805,17 @@
+     return true;
+   }
+ 
++  // Keep the unchanged wire bytes together: sending a short header and
++  // waiting on another small write can couple Nagle with delayed ACKs.
++  const std::size_t iso_bytes = reply_iso.size() * sizeof(UsbipIsoPacketDescriptor);
++  std::vector<std::uint8_t> reply_bytes(sizeof(ret) + reply_data.size() + iso_bytes);
++  std::memcpy(reply_bytes.data(), &ret, sizeof(ret));
++  if (!reply_data.empty())
++    std::memcpy(reply_bytes.data() + sizeof(ret), reply_data.data(), reply_data.size());
++  if (iso_bytes)
++    std::memcpy(reply_bytes.data() + sizeof(ret) + reply_data.size(), reply_iso.data(), iso_bytes);
+   std::lock_guard<std::mutex> send_guard(socket_send_mutex);
+-  if (!send_exact(client, &ret, sizeof(ret))) {
+-    return false;
+-  }
+-  if (!reply_data.empty() &&
+-      !send_exact(client, reply_data.data(), reply_data.size())) {
+-    return false;
+-  }
+-  if (cmd.number_of_packets > 0) {
+-    // reply_iso was already built above (needed early so the RET_SUBMIT
+-    // header's actual_length could be the sum of these packets' actual
+-    // lengths). Just send it here.
+-    if (!reply_iso.empty() &&
+-        !send_exact(client, reply_iso.data(),
+-                    reply_iso.size() * sizeof(UsbipIsoPacketDescriptor))) {
+-      return false;
+-    }
+-  }
+-  return true;
++  return send_exact(client, reply_bytes.data(), reply_bytes.size());
+ }
+ 
+ bool client_available() {
+--- a/src/platform/win32/vds_bt.cc
++++ b/src/platform/win32/vds_bt.cc
+@@ -418,7 +418,7 @@
+   }
+ 
+   std::optional<std::string> take_output_diagnostics(bool force) override {
+-    std::lock_guard guard(output_mutex_);
++    std::unique_lock guard(output_mutex_);
+     if (!force && !output_diagnostic_pending_) {
+       return std::nullopt;
+     }
+@@ -430,28 +430,72 @@
+       return std::nullopt;
+     }
+ 
+-    std::string message =
+-        "hid output writer queued=" + std::to_string(output_queued_count_) +
+-        " completed=" + std::to_string(output_completed_count_) +
+-        " rejected=" + std::to_string(output_rejected_count_) +
+-        " audio_coalesced=" + std::to_string(output_audio_coalesced_count_) +
+-        " queued_delta=" + std::to_string(output_queued_since_diagnostic_) +
+-        " completed_delta=" +
+-        std::to_string(output_completed_since_diagnostic_) +
+-        " rejected_delta=" + std::to_string(output_rejected_since_diagnostic_) +
+-        " audio_coalesced_delta=" +
+-        std::to_string(output_audio_coalesced_since_diagnostic_) +
+-        " pending=" + std::to_string(output_queue_.size());
+-    if (!output_error_.empty()) {
+-      message += " error=" + output_error_;
+-    }
++    const auto pending = output_queue_.size();
++    const auto snapshot_output_audio_coalesced_count_ = output_audio_coalesced_count_;
++    const auto snapshot_output_audio_coalesced_since_diagnostic_ = output_audio_coalesced_since_diagnostic_;
++    const auto snapshot_output_completed_count_ = output_completed_count_;
++    const auto snapshot_output_completed_since_diagnostic_ = output_completed_since_diagnostic_;
++    const auto snapshot_output_error_ = output_error_;
++    const auto snapshot_output_queued_count_ = output_queued_count_;
++    const auto snapshot_output_queued_since_diagnostic_ = output_queued_since_diagnostic_;
++    const auto snapshot_output_rejected_count_ = output_rejected_count_;
++    const auto snapshot_output_rejected_since_diagnostic_ = output_rejected_since_diagnostic_;
+ 
+     output_diagnostic_pending_ = false;
+     output_queued_since_diagnostic_ = 0;
+     output_completed_since_diagnostic_ = 0;
+     output_rejected_since_diagnostic_ = 0;
+     output_audio_coalesced_since_diagnostic_ = 0;
++    guard.unlock();
++
++    std::string message =
++        "hid output writer queued=" + std::to_string(snapshot_output_queued_count_) +
++        " completed=" + std::to_string(snapshot_output_completed_count_) +
++        " rejected=" + std::to_string(snapshot_output_rejected_count_) +
++        " audio_coalesced=" + std::to_string(snapshot_output_audio_coalesced_count_) +
++        " queued_delta=" + std::to_string(snapshot_output_queued_since_diagnostic_) +
++        " completed_delta=" +
++        std::to_string(snapshot_output_completed_since_diagnostic_) +
++        " rejected_delta=" + std::to_string(snapshot_output_rejected_since_diagnostic_) +
++        " audio_coalesced_delta=" +
++        std::to_string(snapshot_output_audio_coalesced_since_diagnostic_) +
++        " pending=" + std::to_string(pending);
++    if (!snapshot_output_error_.empty()) {
++      message += " error=" + snapshot_output_error_;
++    }
+     return message;
++  }
++
++  // Used only after every producer and the normal writer have joined.
++  // It has its own completion event because the normal stop event is latched.
++  void write_shutdown_packet(std::span<const std::uint8_t> packet) override {
++    if (packet.empty() || packet[0] != kBtHidpOutputPrefix)
++      throw std::runtime_error("invalid shutdown HID packet");
++    {
++      std::lock_guard guard(output_mutex_);
++      if (!output_stop_requested_ || output_thread_.joinable())
++        throw std::runtime_error("shutdown write requires stopped output writer");
++    }
++    auto write = make_output_write(packet.subspan(1));
++    UniqueHandle event(CreateEventA(nullptr, TRUE, FALSE, nullptr));
++    if (!event) throw std::runtime_error("shutdown completion event failed");
++    OVERLAPPED op{};
++    op.hEvent = event.get();
++    if (!WriteFile(output_handle_.get(), write.buffer.data(),
++                   static_cast<DWORD>(write.buffer.size()), nullptr, &op) &&
++        GetLastError() != ERROR_IO_PENDING)
++      throw std::runtime_error("shutdown HID write failed: " + win32_error_message(GetLastError()));
++    if (WaitForSingleObject(event.get(), 500) != WAIT_OBJECT_0) {
++      CancelIoEx(output_handle_.get(), &op);
++      DWORD ignored = 0;
++      // Reap cancellation before releasing the OVERLAPPED and its buffer.
++      GetOverlappedResult(output_handle_.get(), &op, &ignored, TRUE);
++      throw std::runtime_error("shutdown HID write timed out");
++    }
++    DWORD written = 0;
++    if (!GetOverlappedResult(output_handle_.get(), &op, &written, FALSE) ||
++        written != write.buffer.size())
++      throw std::runtime_error("shutdown HID write incomplete");
+   }
+ 
+   void cancel() override {
+--- a/src/platform/win32/vds_bt.hh
++++ b/src/platform/win32/vds_bt.hh
+@@ -32,6 +32,7 @@
+     (void)force;
+     return std::nullopt;
+   }
++  virtual void write_shutdown_packet(std::span<const std::uint8_t> packet) = 0;
+   virtual void cancel() = 0;
+   virtual std::string description() const = 0;
+ };
+--- a/src/vds_log.hh
++++ b/src/vds_log.hh
+@@ -3,6 +3,9 @@
+ #pragma once
+ 
+ #include <fstream>
++#include <chrono>
++#include <memory>
++#include "diagnostic_worker.hh"
+ #include <mutex>
+ #include <string>
+ #include <string_view>
+@@ -33,15 +36,29 @@
+ public:
+   explicit Logger(const std::string &path);
+ 
++  ~Logger();
+   void reopen();
++  // Info/Debug may be dropped under load. Warn/Error keep synchronous logging.
++  bool log_diagnostic(LogScope scope, LogLevel level, std::string_view message);
+   void log(LogScope scope, LogLevel level, std::string_view message);
+ 
+ private:
++  struct DiagnosticRecord {
++    std::chrono::system_clock::time_point timestamp{};
++    LogScope scope{};
++    LogLevel level{};
++    std::size_t size = 0;
++    std::array<char, 4096> message{};
++  };
++  void log_at(LogScope scope, LogLevel level, std::string_view message,
++              std::chrono::system_clock::time_point timestamp);
+   std::ofstream open_file() const;
+ 
+   std::mutex mutex_;
+   std::string path_;
+   std::ofstream file_;
++  // Destroyed before file_/mutex_; the destructor explicitly drains it.
++  std::unique_ptr<dsbridge::DiagnosticWorker<DiagnosticRecord, 256>> diagnostics_;
+ };
+ 
+ const char *log_level_name(LogLevel level);
+--- a/src/vds_log.cc
++++ b/src/vds_log.cc
+@@ -2,6 +2,7 @@
+ // Copyright (C) 2026 Jihong Min <hurryman2212@gmail.com>
+ 
+ #include <chrono>
++#include <cstring>
+ #include <cstdlib>
+ #include <ctime>
+ #include <filesystem>
+@@ -30,8 +31,7 @@
+ constexpr mode_t kVdsLogFileMode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
+ #endif
+ 
+-std::string local_timestamp() {
+-  const auto now = std::chrono::system_clock::now();
++std::string local_timestamp(std::chrono::system_clock::time_point now) {
+   const auto seconds = std::chrono::time_point_cast<std::chrono::seconds>(now);
+   const auto milliseconds =
+       std::chrono::duration_cast<std::chrono::milliseconds>(now - seconds)
+@@ -108,7 +108,39 @@
+ 
+ namespace vds {
+ 
+-Logger::Logger(const std::string &path) : path_(path) { file_ = open_file(); }
++Logger::Logger(const std::string &path) : path_(path) {
++  file_ = open_file();
++  diagnostics_ = std::make_unique<dsbridge::DiagnosticWorker<DiagnosticRecord, 256>>(
++      [this](const DiagnosticRecord& record) {
++        log_at(record.scope, record.level,
++               std::string_view(record.message.data(), record.size), record.timestamp);
++      },
++      [this](std::uint64_t dropped, std::uint64_t failed) {
++        log(LogScope::Daemon, LogLevel::Warn,
++            "diagnostic logging loss dropped=" + std::to_string(dropped) +
++            " failed=" + std::to_string(failed));
++      });
++}
++
++Logger::~Logger() { diagnostics_.reset(); }
++
++bool Logger::log_diagnostic(LogScope scope, LogLevel level, std::string_view message) {
++  if (level == LogLevel::Warn || level == LogLevel::Error) {
++    log(scope, level, message);
++    return true;
++  }
++  DiagnosticRecord record{};
++  if (message.size() > record.message.size()) {
++    diagnostics_->note_drop();
++    return false;
++  }
++  record.timestamp = std::chrono::system_clock::now();
++  record.scope = scope;
++  record.level = level;
++  record.size = message.size();
++  if (!message.empty()) std::memcpy(record.message.data(), message.data(), message.size());
++  return diagnostics_->try_submit(record);
++}
+ 
+ std::ofstream Logger::open_file() const {
+   const std::filesystem::path log_path(path_);
+@@ -134,8 +166,13 @@
+ }
+ 
+ void Logger::log(LogScope scope, LogLevel level, std::string_view message) {
++  log_at(scope, level, message, std::chrono::system_clock::now());
++}
++
++void Logger::log_at(LogScope scope, LogLevel level, std::string_view message,
++                    std::chrono::system_clock::time_point timestamp) {
+   std::lock_guard guard(mutex_);
+-  file_ << local_timestamp() << '|' << log_scope_name(scope) << '|'
++  file_ << local_timestamp(timestamp) << '|' << log_scope_name(scope) << '|'
+         << log_level_name(level) << '|';
+   write_log_message(file_, message);
+   file_ << '\n';
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -101,12 +101,6 @@
+                                            ${CMAKE_CURRENT_SOURCE_DIR}/src)
+   target_link_libraries(vds_bt PUBLIC vds_protocol vds_common vds_io hid
+                                       setupapi bthprops cfgmgr32)
+-
+-  add_library(vds_hidhide OBJECT src/platform/win32/vds_hidhide.cc)
+-  target_include_directories(
+-    vds_hidhide PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+-                       ${CMAKE_CURRENT_SOURCE_DIR}/src)
+-  target_link_libraries(vds_hidhide PUBLIC vds_log vds_win32)
+ 
+   add_library(vds_usbip OBJECT src/platform/win32/vds_usbip.cc)
+   target_include_directories(
+@@ -125,7 +119,6 @@
+             vds_bt
+             vds_common
+             vds_config
+-            vds_hidhide
+             vds_log
+             vds_io
+             vds_usbip
+@@ -328,3 +321,6 @@
+                         ${VDS_INSTALLED_VDSCTL})
+   endif()
+ endif()
++
++add_executable(dsbridge_runtime_tests src/dsbridge_runtime_tests.cc src/dsbridge_diagnostic_tests.cc)
++target_link_libraries(dsbridge_runtime_tests PRIVATE vds_protocol vds_log ${VDS_OPUS_TARGET})
+--- /dev/null
++++ b/src/bridge_runtime.hh
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <chrono>
++#include <deque>
++#include "vds_protocol.hh"
++
++namespace dsbridge {
++using Clock = std::chrono::steady_clock;
++inline constexpr std::size_t kPrimeChunks = 3; // 32 ms of PCM after removing HID head-of-line blocking.
++inline constexpr std::size_t kMaxChunks = 12;  // Absorb Windows bursts; real queue age is capped below.
++inline constexpr auto kPrimeTimeout = std::chrono::milliseconds(35);
++inline constexpr auto kMaxChunkAge = std::chrono::milliseconds(100);
++
++template<class T> class TimedQueue {
++  struct Entry { T value; Clock::time_point at; };
++  std::deque<Entry> entries_;
++public:
++  bool empty() const { return entries_.empty(); }
++  std::size_t size() const { return entries_.size(); }
++  void clear() { entries_.clear(); }
++  void push_back(const T& value, Clock::time_point now = Clock::now()) {
++    entries_.push_back({value,now});
++  }
++  void pop_front() { entries_.pop_front(); }
++  const T& front() const { return entries_.front().value; }
++  Clock::duration front_age(Clock::time_point now = Clock::now()) const {
++    return empty() ? Clock::duration::zero() : now-entries_.front().at;
++  }
++  std::size_t discard_expired(Clock::time_point now = Clock::now()) {
++    std::size_t count=0;
++    while(!empty() && front_age(now)>=kMaxChunkAge) { pop_front(); ++count; }
++    return count;
++  }
++};
++
++// Preserve light/mic-button preferences; release forces and stop bridge-owned audio.
++// The caller also closes the microphone stream using the existing protocol builder.
++inline vds::BtStateReport neutral_output(vds::DsOutputState& state, bool headset) {
++  std::array<std::uint8_t,48> usb{};
++  usb[0]=VDS_USB_OUTPUT_REPORT_ID;
++  usb[1]=0x2f; // zero rumble, both trigger effects off, speaker volume zero.
++  state.set_audio_out_stream_active(false,headset);
++  state.apply_usb_output_report(usb);
++  return state.build_bt_state_report();
++}
++}
+--- /dev/null
++++ b/src/usbip_hid_queue.hh
+@@ -0,0 +1,47 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <deque>
++#include <optional>
++#include <utility>
++
++namespace dsbridge {
++// Transitions and the accepts check at send are serialized by socket_send_mutex.
++// Producers may take atomic snapshots without holding the send mutex.
++class ReplyEpoch {
++  std::atomic_uint64_t epoch_{0};
++public:
++  std::uint64_t activate(){const auto next=(epoch_.load()+2)|std::uint64_t{1};epoch_=next;return next;}
++  void invalidate(){epoch_=(epoch_.load()+1)&~std::uint64_t{1};}
++  std::uint64_t current()const{return epoch_.load();}
++  bool accepts(std::uint64_t token)const{return (token&1)!=0 && token==epoch_.load();}
++};
++
++// Caller owns synchronization. An input request must never wait on the USB/IP
++// receive thread, which also accepts time-sensitive audio OUT submissions.
++template<class Request, class Report> class PendingHidQueue {
++  std::deque<Request> requests_;
++  std::deque<Report> reports_;
++public:
++  bool submit(Request request) {
++    if(requests_.size()>=64 || std::any_of(requests_.begin(),requests_.end(),
++        [&](const auto& r){return r.seqnum==request.seqnum;}))return false;
++    requests_.push_back(std::move(request)); return true;
++  }
++  void report(Report value) {
++    if(reports_.size()>=8)reports_.pop_front();
++    reports_.push_back(std::move(value));
++  }
++  std::optional<std::pair<Request,Report>> take_ready() {
++    if(requests_.empty()||reports_.empty())return std::nullopt;
++    auto result=std::pair{std::move(requests_.front()),std::move(reports_.front())};
++    requests_.pop_front();reports_.pop_front();return result;
++  }
++  bool cancel(std::uint32_t seqnum) {
++    return std::erase_if(requests_,[&](const auto& r){return r.seqnum==seqnum;})!=0;
++  }
++  void clear(){requests_.clear();reports_.clear();}
++};
++}
+--- /dev/null
++++ b/src/diagnostic_worker.hh
+@@ -0,0 +1,117 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <thread>
++#include <type_traits>
++#include <utility>
++
++namespace dsbridge {
++// Ordinary diagnostics only. Producers never wait for the sink or for a queue
++// lock. Storage is fixed at construction; a slow sink loses diagnostics, not
++// controller data. The owner must join all producers before destruction.
++template<class Record, std::size_t Capacity> class DiagnosticWorker {
++  static_assert(Capacity > 0 && std::is_trivially_copyable_v<Record>);
++public:
++  using Sink = std::function<void(const Record&)>;
++  using LossSink = std::function<void(std::uint64_t, std::uint64_t)>;
++  DiagnosticWorker(Sink sink, LossSink loss)
++      : records_(std::make_unique<std::array<Record, Capacity>>()),
++        sink_(std::move(sink)), loss_(std::move(loss)),
++        worker_([this] { run(); }) {}
++  ~DiagnosticWorker() { stop(); }
++  DiagnosticWorker(const DiagnosticWorker&) = delete;
++  DiagnosticWorker& operator=(const DiagnosticWorker&) = delete;
++
++  bool try_submit(const Record& record) noexcept {
++    std::unique_lock lock(mutex_, std::try_to_lock);
++    if (!lock.owns_lock() || closing_ || size_ == Capacity) {
++      note_drop();
++      return false;
++    }
++    (*records_)[(head_ + size_) % Capacity] = record;
++    ++size_;
++    lock.unlock();
++    ready_.notify_one();
++    return true;
++  }
++
++  void note_drop() noexcept {
++    dropped_.fetch_add(1, std::memory_order_relaxed);
++    pending_drops_.fetch_add(1, std::memory_order_relaxed);
++    ready_.notify_one();
++  }
++
++  // Owner thread only; drains all accepted entries before joining the sink.
++  // No detached worker can outlive the logger/file it refers to.
++  void stop() {
++    {
++      std::lock_guard lock(mutex_);
++      closing_ = true;
++    }
++    ready_.notify_one();
++    if (worker_.joinable()) worker_.join();
++  }
++  std::uint64_t dropped() const { return dropped_.load(); }
++  std::uint64_t failed() const { return failed_.load(); }
++
++private:
++  void report_loss(std::uint64_t dropped, std::uint64_t failed) noexcept {
++    if (!dropped && !failed) return;
++    try { loss_(dropped, failed); } catch (...) {
++      // A broken diagnostic sink must not terminate controller threads.
++      failed_.fetch_add(1, std::memory_order_relaxed);
++    }
++  }
++  void run() noexcept {
++    for (;;) {
++      Record record{};
++      bool have_record = false;
++      bool done = false;
++      std::uint64_t dropped = 0;
++      {
++        std::unique_lock lock(mutex_);
++        // Timeout also covers a loss-only notification racing the wait;
++        // ordinary records and shutdown use the same mutex as this predicate.
++        ready_.wait_for(lock, std::chrono::seconds(1), [this] {
++          return closing_ || size_ || pending_drops_.load();
++        });
++        dropped = pending_drops_.exchange(0);
++        if (size_) {
++          record = (*records_)[head_];
++          head_ = (head_ + 1) % Capacity;
++          --size_;
++          have_record = true;
++        }
++        done = closing_ && !have_record;
++      }
++      // No queue lock is held during formatting, file I/O or callbacks.
++      report_loss(dropped, 0);
++      if (have_record) {
++        try { sink_(record); } catch (...) {
++          failed_.fetch_add(1, std::memory_order_relaxed);
++          report_loss(0, 1);
++        }
++      }
++      if (done) return;
++    }
++  }
++  std::unique_ptr<std::array<Record, Capacity>> records_;
++  Sink sink_;
++  LossSink loss_;
++  std::mutex mutex_;
++  std::condition_variable ready_;
++  std::size_t head_ = 0;
++  std::size_t size_ = 0;
++  bool closing_ = false;
++  std::atomic_uint64_t dropped_{0}, pending_drops_{0}, failed_{0};
++  std::thread worker_; // Last: every field it uses is initialized first.
++};
++} // namespace dsbridge
+--- /dev/null
++++ b/src/dsbridge_runtime_tests.cc
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: MIT
++#include <iostream>
++#include <stdexcept>
++#include "bridge_runtime.hh"
++#include "usbip_hid_queue.hh"
++using namespace std::chrono_literals;
++void test_diagnostics();
++void require(bool value, const char* why) {
++  if(!value) throw std::runtime_error(why);
++}
++int main() {
++  try {
++    test_diagnostics();
++    dsbridge::ReplyEpoch epoch;
++    require(!epoch.accepts(epoch.current()),"inactive session accepts a reply");
++    const auto first_session=epoch.activate();
++    require(epoch.accepts(first_session),"current session reply rejected");
++    const auto popped_reply=epoch.current();
++    epoch.invalidate();
++    require(!epoch.accepts(popped_reply),"dequeued reply survives disconnect");
++    const auto reused_socket_session=epoch.activate();
++    require(epoch.accepts(reused_socket_session) && !epoch.accepts(popped_reply),"old reply accepted after socket reuse");
++    struct Request {std::uint32_t seqnum;};
++    dsbridge::PendingHidQueue<Request,int> hid;
++    require(hid.submit({10}) && !hid.take_ready(),"HID submit without input must return pending immediately");
++    require(!hid.submit({10}),"duplicate pending HID sequence accepted");
++    require(hid.submit({11}) && hid.cancel(10),"pending HID unlink failed");
++    hid.report(42);
++    auto ready=hid.take_ready();
++    require(ready && ready->first.seqnum==11 && ready->second==42,"cancelled request consumed a report or FIFO order lost");
++    require(!hid.cancel(11),"completed request must not report unlink success");
++    for(int i=0;i<12;++i)hid.report(i);
++    require(hid.submit({12}),"request rejected with queued reports");
++    require(hid.take_ready()->second==4,"stale report queue is not bounded to eight");
++    hid.clear();
++    for(unsigned i=0;i<64;++i)require(hid.submit({i}),"normal pending request rejected");
++    require(!hid.submit({65}),"unbounded pending requests");
++    hid.clear();hid.report(7);
++    require(!hid.take_ready(),"old session request survived clear");
++    hid.clear();require(hid.submit({100}) && !hid.take_ready(),"old session report survived clear");
++    dsbridge::TimedQueue<int> q;
++    const auto t=dsbridge::Clock::time_point{}+1s;
++    q.push_back(1,t); q.push_back(2,t+20ms); q.push_back(3,t+90ms);
++    require(q.discard_expired(t+99ms)==0,"fresh chunks were dropped");
++    require(q.discard_expired(t+100ms)==1 && q.front()==2,"expiry boundary/order");
++    require(q.discard_expired(t+150ms)==1 && q.front()==3,"late arrival must stay");
++    require(q.front_age(t+150ms)==60ms,"queue age measures enqueue to dequeue");
++    q.clear();
++    require(q.empty() && q.front_age(t)==0ms,"reset must clear timestamps");
++    // A producer burst and a paused consumer must not replay stale feedback.
++    for(int i=0;i<40;++i) {
++      if(q.size()>=dsbridge::kMaxChunks)q.pop_front();
++      q.push_back(i,t);
++    }
++    require(q.size()==12 && q.front()==28,"burst must retain newest bounded data");
++    require(q.discard_expired(t+101ms)==12 && q.empty(),"resume replayed stale burst");
++    require(dsbridge::kPrimeChunks*512.0/48000 < .035,"priming budget regression");
++
++    vds::DsOutputState state;
++    std::array<std::uint8_t,48> game{};
++    game[0]=2; game[1]=0x2f; game[2]=4;
++    game[3]=200; game[4]=200; game[6]=90;
++    game[11]=1; game[12]=40; game[13]=80;
++    game[22]=1; game[23]=40; game[24]=80;
++    game[45]=11;game[46]=22;game[47]=33;
++    require(state.apply_usb_output_report(game),"game report setup failed");
++    const auto stopped=dsbridge::neutral_output(state,false);
++    require((stopped[3]&0x0c)==0x0c,"trigger disable flags missing");
++    require(stopped[5]==0 && stopped[6]==0,"rumble left running");
++    for(int i=13;i<35;++i)require(stopped[i]==0,"trigger effect left running");
++    require(stopped[8]==0 && (stopped[3]&0x20)!=0,"speaker zero volume must have enable flag");
++    require(stopped[47]==11 && stopped[48]==22 && stopped[49]==33,"light preference overwritten");
++    auto checksum=stopped;
++    vds::fill_output_report_checksum(checksum);
++    require(checksum==stopped,"shutdown report CRC mismatch");
++    auto mic=state.build_bt_mic_report(false);
++    require(mic[4]==0xfe,"mic close opcode incorrect");
++    std::cout<<"runtime checks passed: asynchronous HID pairing, unlink, FIFO, bounds, session reset; audio expiry, burst bound, priming, neutral forces, light, CRC, mic close\n";
++    return 0;
++  } catch(const std::exception& e) { std::cerr<<e.what()<<"\n";return 1; }
++}
+--- /dev/null
++++ b/src/dsbridge_diagnostic_tests.cc
+@@ -0,0 +1,127 @@
++// SPDX-License-Identifier: MIT
++#include "diagnostic_worker.hh"
++#include "vds_log.hh"
++#include <chrono>
++#include <filesystem>
++#include <fstream>
++#include <future>
++#include <iostream>
++#include <iterator>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
++using namespace std::chrono_literals;
++extern void require(bool, const char*);
++namespace {
++template<class Queue, class Record> void submit(Queue& queue, const Record& record) {
++  const auto until = std::chrono::steady_clock::now() + 2s;
++  while (!queue.try_submit(record)) {
++    require(std::chrono::steady_clock::now() < until, "diagnostic producer stalled");
++    std::this_thread::yield();
++  }
++}
++std::string read(const std::filesystem::path& path) {
++  std::ifstream file(path);
++  return {std::istreambuf_iterator<char>(file), {}};
++}
++}
++
++void test_diagnostics() {
++  // The sink deliberately hangs until the producer has filled/overflowed the
++  // queue. Completion before release proves producers do not wait for sink I/O.
++  std::promise<void> entered, release;
++  auto released = release.get_future().share();
++  std::vector<int> received;
++  std::uint64_t reported_drops = 0;
++  dsbridge::DiagnosticWorker<int, 4> queue([&](int value) {
++    if (value == 0) { entered.set_value(); released.wait(); }
++    received.push_back(value);
++  }, [&](auto dropped, auto) { reported_drops += dropped; });
++  submit(queue, 0);
++  const bool started = entered.get_future().wait_for(2s) == std::future_status::ready;
++  if (!started) { release.set_value(); require(false, "diagnostic worker did not start"); }
++  auto producer = std::async(std::launch::async, [&] {
++    int accepted = 0;
++    for (int i = 1; i <= 100; ++i) accepted += queue.try_submit(i) ? 1 : 0;
++    return accepted;
++  });
++  const bool returned_while_blocked = producer.wait_for(500ms) == std::future_status::ready;
++  release.set_value();
++  const int accepted = producer.get();
++  queue.stop();
++  queue.stop(); // Owner stop is idempotent; no background callback remains.
++  require(returned_while_blocked, "diagnostic producer waited for blocked sink");
++  require(accepted == 4 && received == std::vector<int>({0,1,2,3,4}), "bounded diagnostic FIFO/drain failed");
++  require(queue.dropped() == 96 && reported_drops == 96, "diagnostic loss is not accounted for");
++  require(!queue.try_submit(200), "closed diagnostic worker accepted a record");
++
++  // Multiple real producers: every accepted record is delivered once, in each
++  // producer's order; rejected diagnostics are explicit, never silently lost.
++  struct Record { int producer, sequence; };
++  std::vector<Record> delivered;
++  std::atomic_uint64_t attempted{0}, accepted_count{0};
++  std::uint64_t losses = 0;
++  dsbridge::DiagnosticWorker<Record, 64> concurrent(
++      [&](const Record& r) { delivered.push_back(r); },
++      [&](auto dropped, auto) { losses += dropped; });
++  std::vector<std::thread> producers;
++  for (int p = 0; p < 4; ++p) producers.emplace_back([&, p] {
++    for (int i = 0; i < 2000; ++i) {
++      ++attempted;
++      if (concurrent.try_submit({p, i})) ++accepted_count;
++    }
++  });
++  for (auto& thread : producers) thread.join();
++  concurrent.stop();
++  int previous[4] = {-1,-1,-1,-1};
++  for (auto r : delivered) {
++    require(r.sequence > previous[r.producer], "diagnostic duplicated or reordered");
++    previous[r.producer] = r.sequence;
++  }
++  require(delivered.size() == accepted_count && delivered.size() + losses == attempted,
++          "diagnostic concurrent stop/drain accounting failed");
++
++  int last = 0;
++  std::uint64_t failed_reports = 0;
++  dsbridge::DiagnosticWorker<int, 4> failing([&](int value) {
++    if (value == 1) throw std::runtime_error("injected sink failure");
++    last = value;
++  }, [&](auto, auto failures) { failed_reports += failures; });
++  submit(failing, 1); submit(failing, 2); failing.stop();
++  require(last == 2 && failing.failed() == 1 && failed_reports == 1,
++          "sink failure terminated diagnostics or hid failure");
++
++  const auto root = std::filesystem::current_path() / ".local" / "tests" /
++      ("diagnostics-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
++  std::filesystem::create_directories(root);
++  const auto path = root / "logger.log";
++  {
++    vds::Logger logger(path.string());
++    const auto ordinary = [&](const char* message) {
++      const auto until = std::chrono::steady_clock::now() + 2s;
++      while (!logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Info, message)) {
++        require(std::chrono::steady_clock::now() < until, "logger could not accept ordinary record");
++        std::this_thread::yield();
++      }
++    };
++    ordinary("ordinary|line\nend");
++    logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Warn, "critical-warning");
++    logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Error, "critical-error");
++    logger.log(vds::LogScope::Output, vds::LogLevel::Info, "shutdown-neutral-confirmed");
++    auto before_drain = read(path);
++    require(before_drain.find("critical-warning") != std::string::npos &&
++            before_drain.find("critical-error") != std::string::npos &&
++            before_drain.find("shutdown-neutral-confirmed") != std::string::npos,
++            "critical/recovery log was deferred or dropped");
++    logger.log_diagnostic(vds::LogScope::Output, vds::LogLevel::Debug, std::string(4097, 'x'));
++    logger.reopen();
++    ordinary("after-reopen");
++  }
++  const auto contents = read(path);
++  require(contents.find("ordinary line end") != std::string::npos &&
++          contents.find("after-reopen") != std::string::npos &&
++          contents.find("diagnostic logging loss dropped=") != std::string::npos,
++          "logger drain, escaping, reopen or oversize accounting failed");
++  std::cout << "diagnostic checks passed: blocked sink isolation, bounded FIFO, loss accounting, concurrent producers, stop/drain, sink failure, critical/recovery logs, reopen\n";
++}

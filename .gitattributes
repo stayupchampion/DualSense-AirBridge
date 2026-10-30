@@ -1,0 +1,12 @@
+* text=auto
+*.md text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.py text eol=lf
+*.ps1 text eol=lf
+*.cs text eol=lf
+*.cc text eol=lf
+*.hh text eol=lf
+*.patch text eol=lf
+*.png binary
+*.ico binary
