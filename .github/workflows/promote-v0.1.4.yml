@@ -1,0 +1,28 @@
+name: Promote v0.1.4 to Latest
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/promote-v0.1.4.yml']
+permissions:
+  contents: write
+jobs:
+  promote:
+    if: github.repository == 'stayupchampion/DualSense-AirBridge'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Change only release classification and verify preservation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          endpoint=repos/stayupchampion/DualSense-AirBridge/releases/429291741
+          gh api "$endpoint" > before.json
+          jq -e '.tag_name == "v0.1.4" and .draft == false and (.assets | length) == 3' before.json
+          gh api --method PATCH "$endpoint" -F prerelease=false -f make_latest=true > after.json
+          jq -S '{id,tag_name,name,body,assets:[.assets[]|{id,name,size,digest,browser_download_url}]}' before.json > before-preserved.json
+          jq -S '{id,tag_name,name,body,assets:[.assets[]|{id,name,size,digest,browser_download_url}]}' after.json > after-preserved.json
+          diff -u before-preserved.json after-preserved.json
+          jq -e '.prerelease == false and .draft == false' after.json
+          gh api repos/stayupchampion/DualSense-AirBridge/releases/latest --jq '.tag_name' | grep -Fx v0.1.4
