@@ -38,7 +38,7 @@ Historical initial tests were software-only. The empty-session stop test substit
 0.1.1 runtime additions are in ../scripts/backend_runtime_patch.py and bridge_runtime.hh:
 6 PCM chunks prime (~64 ms), 12 chunks burst capacity, discard enqueued data aged 100 ms, queue-age diagnostics, and a dequeue performed while holding the queue lock. These bound this queue, not end-to-end device latency.
 After producer threads join, cancel and join the ordinary HID writer, then write neutral state and mic-close reports to the same physical device. No adapter reset is involved. Each final write has a 500 ms wait threshold; cancellation completion can take longer, so the manager's overall shutdown deadline remains in force.
-The build also runs ../tests/backend_runtime_tests.cc. It verifies final nonzero force reset, output enable bits, LED preservation, CRC, queue expiry and burst bounds.
+The build also runs ../tests/backend_runtime_tests.cc. It verifies final nonzero force reset, output enable bits, CRC, queue expiry and burst bounds. Since 0.1.5-dev.4, terminal LED-only reports release host/player lights and request firmware-native lighting after force/microphone cleanup. They bypass speaker preference filtering to avoid adding audio writes. A separate log marker confirms these writes; pre-session arbitrary custom lighting cannot be read back reliably. See ../docs/controller-state-recovery.md.
 
 0.1.3 additionally removes HID-input head-of-line blocking from the USB/IP receive
 thread via ../scripts/backend_async_hid_patch.py and usbip_hid_queue.hh. Pending
@@ -79,3 +79,24 @@ controller speaker to muted. A final-write filter preserves non-speaker fields
 and recomputes CRC for state, init and audio reports; the retained game state is
 re-applied when unmuting. The whole four-channel endpoint is never muted.
 See ../docs/controller-controls.md for protocol sources and hardware-test limits.
+
+The unreleased 0.1.5-dev.2 audio-protection candidate adds
+../scripts/backend_audio_patch.py and usb_audio_controls.hh. UAC1 master mute
+and volume for playback Feature Unit 2 and capture Feature Unit 5 have separate
+state. Requests validate interface, entity, channel, selector and data length.
+Playback gain changes only the first two PCM channels; haptic samples remain
+bit-identical. Capture gain affects only microphone PCM. USB descriptors,
+identity, sample rates, packet timing, HID, Bluetooth writing, haptic pacing and
+buffer limits are unchanged. --bridge-info reports independentAudioControls so
+the matching app rejects older backends. Tests exercise every PCM16 value in
+both playback channels at four gains and retain both haptic channels exactly.
+No default-endpoint exclusion policy or driver is installed by this patch.
+See ../docs/audio-safety-candidate.md for software evidence and hardware gates.
+
+The unreleased 0.1.5-dev.3 candidate adds ../scripts/backend_lifecycle_patch.py
+and usbip_handshake.hh. The listener starts in the constructor body, after its
+synchronization fields exist. Pre-import header/busid reads share a 10-second
+absolute deadline and check stop requests; imported HID/ISO traffic is unchanged.
+Tests use ephemeral loopback sockets only, covering fragmented input, silent and
+slow peers, EOF and stop. No bridge port, controller or driver is involved.
+See ../docs/stability-recovery-review.md for shutdown recovery and hardware gates.

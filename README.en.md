@@ -4,13 +4,13 @@
 <h1 align="center">DualSense AirBridge</h1>
 <p align="center">Bring DualSense haptics across the wireless gap.</p>
 <p align="center"><a href="README.md">简体中文</a> · <strong>English</strong></p>
-<p align="center">Windows x64 · Standard DualSense · Development preview 0.1.4 · MIT</p>
+<p align="center">Windows x64 · Standard DualSense · Release 0.1.5 · MIT</p>
 
 DualSense AirBridge is an unofficial Bluetooth bridge for **Windows PCs and the standard DualSense controller**. Pair the controller through Windows as usual. The tool presents a virtual USB DualSense to compatible games, exposing native input, detailed haptics and adaptive-trigger output paths.
 
 It is intended for PC games with native DualSense support. **It is not a universal PS / Xbox controller mapper, and cannot add effects that a game does not implement.** Phantom Blade Zero (《影之刃：零》) is the first priority for game validation.
 
-> **Preview limitations:** Testing and user feedback come from a limited hardware setup, not broad compatibility certification. The controller speaker was silent in testing; microphone and 3.5mm audio have not been validated. The project does not claim complete wireless support for every USB feature or zero latency.
+> **Support limits:** Testing and user feedback come from a limited hardware setup, not broad compatibility certification. The controller speaker is muted by default and can be enabled in the app; microphone and 3.5mm audio have not been validated. The project does not claim complete wireless support for every USB feature or zero latency.
 
 ## Features and scope
 
@@ -22,23 +22,25 @@ It is intended for PC games with native DualSense support. **It is not a univers
 | Adaptive triggers | Game output forwarding; built-in R2 resistance and cancellation/reset tests passed |
 | Native USB / Bluetooth restoration | Normal stop removes session changes and checks physical input and the previous audio endpoint |
 | Separate Bluetooth audio | Multiple observation windows passed with a Bose device; other adapters and interference conditions remain unverified |
-| Controller speaker / microphone / 3.5mm audio | Speaker test failed; the remaining paths are unvalidated and not advertised as working |
+| Controller speaker / microphone / 3.5mm audio | Speaker muted by default with a manual option; microphone and 3.5mm audio remain unvalidated |
 | DualSense Edge / DualShock 4 / Xbox controllers | Not supported as bridge targets; coexistence with other controllers still needs hardware testing |
 | Linux / macOS / Windows ARM64 | Not supported by this application |
 
 Built-in feedback and latency-comparison panels send identical test signals through physical USB and Bluetooth bridging. Software timings describe queues and report arrivals; **they do not measure physical end-to-end latency**.
 
-## In development: battery and speaker controls
+## v0.1.5: interface, controller controls and recovery
 
-The current source also includes a **UI-only refresh**: a light grouped layout, sidebar navigation, separate diagnostics/recovery and guide pages, and consistent feedback/latency windows. Bridge lifecycle, battery reading, mute, audio protection, feedback and timing logic are unchanged. This interface is not yet released; see [UI refresh notes](docs/ui-refresh.md).
-
-These additions are in the unreleased `0.1.5-dev` source. They are **not included in the GitHub v0.1.4 assets**:
+The [v0.1.5 official release](https://github.com/stayupchampion/DualSense-AirBridge/releases/tag/v0.1.5) promotes the hardware-accepted `0.1.5-dev.4` functionality. The refreshed interface uses light grouped panels and sidebar navigation, with separate connection, recovery and guide pages and consistent feedback/latency windows.
 
 - Battery and charging state refresh about every 5 seconds. Bridge mode reuses received input reports without extra controller queries. Capacity is quantized in roughly 10% bands and shown as approximate. Native mode reads one shared input report without changing reporting modes; simple Bluetooth reports may omit battery data. Missing or stale data is not shown as 0%.
 - **Controller speaker mute defaults to on.** Unchecking the option returns speaker control to the game. The preference applies only to this bridge session and resets to muted when the app opens. Haptics, adaptive triggers, microphone and headset fields are preserved; the four-channel virtual USB endpoint is never muted as a whole.
-- A read-only Windows playback-device, volume and mute display refreshes about once per second. This does not prove physical loudness. The reported Bose volume-key issue still requires a native-versus-bridge comparison and is not claimed fixed.
+- A read-only Windows playback-device, volume and mute display refreshes about once per second. This does not prove physical loudness.
+- Virtual speaker/microphone USB volume state is separated. System-audio queries and default-device protection run in a child process with time limits, allowing shutdown to proceed independently of audio queries.
+- Command timeouts, USB/IP handshakes, disconnect status and shutdown recovery are hardened. Shutdown releases bridge lighting, requests firmware-native Bluetooth lighting and reports handoff failures separately. Previously validated haptic buffering is retained.
 
-No startup item, service or driver is added. See [controller controls](docs/controller-controls.md) for implementation, protocol sources and validation limits.
+**Normal stop and direct window close passed hardware acceptance:** the user confirmed working haptics and triggers, restored steady blue lighting, uninterrupted Bose playback and effective volume keys. Natural standby/reconnection and native USB fallback still need retesting on this version. A driver policy excluding virtual endpoints from default-device selection is not enabled; this acceptance does not establish that every Bluetooth audio fault is resolved.
+
+Recovery reverts only tool-owned changes and preserves subsequent user adjustments to external volume and other software settings. No startup item, system service or new driver is added. Exact restoration of unreadable firmware state or arbitrary prior custom lighting is not promised. See [release notes](docs/releases/v0.1.5.md), [controller controls](docs/controller-controls.md), [audio protection](docs/audio-safety-candidate.md), [stability/recovery review](docs/stability-recovery-review.md) and [controller-state recovery](docs/controller-state-recovery.md). Detailed engineering records are in Chinese.
 
 ## How it works
 
@@ -90,7 +92,7 @@ Avoid switching modes while a game is running. Virtual USB and physical Bluetoot
 
 Version 0.1.3 removed HID input waits that blocked audio in the USB/IP receive thread, adjusted local TCP sending and set priming to **3 chunks, approximately 32ms of PCM data**. Version 0.1.4 keeps that setting, moves ordinary diagnostics to a bounded background queue, and formats statistics outside shared state locks to reduce occasional waits caused by logging.
 
-Validation includes **121 C# checks**, C++ runtime and diagnostic-concurrency checks, patch-compatibility checks, haptic/trigger/cancellation tests, and **19 recovery observations over about 90 seconds** after stopping. The user reported a vibration feel close to USB and normal Bose playback in the latest test. These results describe one setup and observation windows, not equal physical latency or permanent stability across games and radio conditions.
+The v0.1.5 functional candidate passed **238 C# checks**, C++ runtime/audio/handshake/diagnostic checks and **4 patch-compatibility checks**. Normal stop and direct window close passed hardware acceptance; **19 recovery observations over about 95 seconds** reported no warnings, with normal Bose playback and effective volume adjustment. Earlier user feedback described the optimized vibration feel as close to USB; this version retains that buffering and makes no new latency-reduction claim. These results describe one setup and observation windows, not equal physical latency or permanent stability across games and radio conditions.
 
 See the [0.1.3 haptics work](docs/haptics-latency-optimization.md), [0.1.4 diagnostics work](docs/diagnostic-jitter-optimization.md), [validation record](docs/validation.md), [feedback tests](docs/feedback-tests.md) and [latency-comparison procedure](docs/latency-comparison.md). These detailed records are currently in Chinese. Historical status statements apply to their dates and versions; raw `.local/` receipts mentioned there are not included in the source repository.
 

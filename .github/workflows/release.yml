@@ -41,7 +41,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Generated source or license drift' }
       - name: Package and inspect release
         run: ./scripts/package-release.ps1 -BuildDirectory '.local/release/app' -OutputDirectory '.local/release/assets'
-      - name: Publish preview release
+      - name: Publish release with versioned notes
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,6 +50,15 @@ jobs:
         run: |
           $version = ([xml](Get-Content src/DsBridge.App/DsBridge.App.csproj -Raw)).Project.PropertyGroup.Version
           if ($env:RELEASE_TAG -ne "v$version") { throw 'Tag does not match app version' }
+          $notes = "docs/releases/v$version.md"
+          if (!(Test-Path -LiteralPath $notes)) { throw 'Versioned release notes are missing' }
           $assets = @(Get-ChildItem .local/release/assets -File | ForEach-Object FullName)
-          gh release create $env:RELEASE_TAG @assets --verify-tag --prerelease --title "$env:RELEASE_TAG - First public preview" --notes-file docs/releases/v0.1.4.md
+          $expected = @("DualSense-AirBridge-v$version-win-x64.zip",'SHA256SUMS.txt','build-manifest.json')
+          if ($assets.Count -ne $expected.Count) { throw 'Unexpected release asset count' }
+          foreach ($name in $expected) {
+            if (!(Test-Path -LiteralPath (Join-Path '.local/release/assets' $name))) { throw "Missing release asset: $name" }
+          }
+          $releaseArgs = @('release','create',$env:RELEASE_TAG) + $assets + @('--verify-tag','--title',"$env:RELEASE_TAG - DualSense AirBridge",'--notes-file',$notes)
+          if ($version.Contains('-')) { $releaseArgs += '--prerelease' } else { $releaseArgs += '--latest' }
+          gh @releaseArgs
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

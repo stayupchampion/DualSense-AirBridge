@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import backend_diagnostics_patch as diagnostics
 import backend_runtime_patch as runtime
+import backend_preferences_patch as preferences
 
 spec = importlib.util.spec_from_file_location('managed_patch', ROOT / 'scripts/patch-backend.py')
 managed = importlib.util.module_from_spec(spec)
@@ -38,6 +39,17 @@ class DiagnosticPatchTests(unittest.TestCase):
     def test_transport_diagnostic_schema_unchanged(self):
         old = runtime.transport((UPSTREAM / 'src/platform/win32/vds_bt.cc').read_text(encoding='utf-8'))
         self.assertEqual(literals(old), literals(diagnostics.transport(old)))
+
+    def test_terminal_lights_bypass_audio_filter(self):
+        source = runtime.transport((UPSTREAM / 'src/platform/win32/vds_bt.cc').read_text(encoding='utf-8'))
+        final = preferences.transport(diagnostics.transport(source))
+        shutdown = final[final.index('  void write_shutdown_packet('):final.index('  void cancel() override')]
+        self.assertIn('if (apply_speaker_preference)\n      dsbridge::mute_speaker_report', shutdown)
+        daemon = runtime.daemon(managed.patch_daemon((UPSTREAM / 'src/platform/win32/vdsd.cc').read_text(encoding='utf-8')))
+        self.assertIn('lighting_handoff(state.output_state, false), "LED release", false)', daemon)
+        self.assertIn('lighting_handoff(state.output_state, true), "native light", false)', daemon)
+        self.assertLess(daemon.index('const bool neutral_ok'), daemon.index('const bool release_ok'))
+        self.assertLess(daemon.index('const bool mic_ok'), daemon.index('const bool release_ok'))
 
 
 if __name__ == '__main__':

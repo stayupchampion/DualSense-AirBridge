@@ -17,6 +17,8 @@ public sealed class Journal {
     public string Address { get; set; } = "";
     public HideState Original { get; set; } = new(false, false, [], []);
     public AudioState Audio { get; set; } = new([], []);
+    // Optional for schema-1 journals from older builds. Startup identity stays in Audio.
+    public AudioState? PreferredAudio { get; set; }
     public bool RegisterIntent { get; set; }
     public bool HideIntent { get; set; }
     public bool CloakIntent { get; set; }
@@ -107,12 +109,39 @@ public static class AtomicJson {
         using (var file = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None)) {
             file.Write(bytes); file.Flush(true);
         }
-        File.Move(tmp, path, true);
+        Publish(tmp,path);
     }
-    public static T Read<T>(string path) => JsonSerializer.Deserialize<T>(File.ReadAllBytes(path), Options)
-        ?? throw new InvalidDataException("状态文件为空");
+    // On Windows, overwrite-Move can still reject an open destination even with
+    // share-delete readers. Replace preserves their old snapshot and existing ACLs.
+    public static void Publish(string prepared,string path) {
+        if(File.Exists(path))File.Replace(prepared,path,null);
+        else File.Move(prepared,path);
+    }
+    public static T Read<T>(string path) {
+        // Readers may retain the old file while an atomic rename publishes the next
+        // snapshot. Without FILE_SHARE_DELETE, a UI poll can fail a recovery write.
+        using var stream=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read|FileShare.Delete);
+        return JsonSerializer.Deserialize<T>(stream,Options)??throw new InvalidDataException("状态文件为空");
+    }
 }
 public static class HideParser {
+    // Both flags bracket the lists, so empty lists are valid but a truncated reply is not.
+    // The caller requests all fields from one CLI instance and finishes with --cancel.
+    public static HideState Snapshot(string text) {
+        var lines=text.Split('\n',StringSplitOptions.RemoveEmptyEntries|StringSplitOptions.TrimEntries);
+        if(lines.Length<4||lines[0]!=lines[^2]||lines[1]!=lines[^1])
+            throw new InvalidDataException("HidHide 状态回复不完整，已停止。");
+        var active=Flag(lines[0],"cloak");var inverse=Flag(lines[1],"inv");
+        var devices=new List<string>();var apps=new List<string>();bool readingApps=false;
+        foreach(var line in lines[2..^2]) {
+            if(line.StartsWith("--app-reg ",StringComparison.Ordinal)) {
+                readingApps=true;apps.AddRange(Entries(line,"--app-reg"));
+            }else if(!readingApps&&line.StartsWith("--dev-hide ",StringComparison.Ordinal))
+                devices.AddRange(Entries(line,"--dev-hide"));
+            else throw new InvalidDataException("无法识别 HidHide 完整状态，已停止。");
+        }
+        return new(active,inverse,devices.ToArray(),apps.ToArray());
+    }
     public static string[] Entries(string text, string command) {
         var values = new List<string>();
         foreach (var line in text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)) {

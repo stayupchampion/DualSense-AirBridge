@@ -4,6 +4,14 @@ namespace DsBridge.App;
 internal static class Program {
     [STAThread] static int Main(string[] args) {
         try {
+            if(args.Length>=2&&args[0]=="--process-fixture")return ProcessChecks.Fixture(args[1..]);
+            if(args.Length==1&&args[0]=="--process-check")return ProcessChecks.CheckAll().GetAwaiter().GetResult();
+            if(args.Length==1&&args[0]=="--audio-worker")return AudioWorker.Serve();
+            if(args.Length==1&&args[0]=="--audio-read-worker")return AudioWorker.Serve(readOnly:true);
+            if(args.Length==2&&args[0]=="--audio-worker-test"&&args[1] is "normal" or "hang" or "exit")return AudioWorker.Serve(args[1]);
+            if(args.Length==2&&args[0]=="--audio-read-worker-test"&&args[1] is "normal" or "observe-hang")return AudioWorker.Serve(args[1],readOnly:true);
+            if(args.Length==1&&args[0]=="--audio-isolation-check")return AudioWorkerChecks.Run().GetAwaiter().GetResult();
+            if(args.Length==2&&args[0]=="--audio-owner-fixture")return AudioWorkerChecks.OwnerFixture(args[1]).GetAwaiter().GetResult();
             if(args.Length==3&&args[0]=="--volume-watch"&&int.TryParse(args[2],out var seconds)&&seconds is >=1 and <=120) {
                 var path=Path.GetFullPath(args[1]);
                 if(!path.StartsWith(Path.GetFullPath(Paths.State)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase))

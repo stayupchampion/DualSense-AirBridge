@@ -51,7 +51,7 @@ Copy-Item -LiteralPath (Join-Path $OpusSource 'LICENSE_PLEASE_READ.txt') -Destin
 $InfoText = & (Join-Path $OutputRoot 'vdsd.exe') --bridge-info
 if ($LASTEXITCODE -ne 0) { throw 'Backend identity check failed' }
 $Info = $InfoText | ConvertFrom-Json
-if ($Info.bridgeProtocol -ne 1 -or !$Info.managedHidHide -or !$Info.stopEvent -or !$Info.exclusiveUsbip -or $Info.serviceMode -or !$Info.singleConnectionSession -or !$Info.controllerPreferences) { throw 'Backend is not the managed foreground fork' }
+if ($Info.bridgeProtocol -ne 1 -or !$Info.managedHidHide -or !$Info.stopEvent -or !$Info.exclusiveUsbip -or $Info.serviceMode -or !$Info.singleConnectionSession -or !$Info.controllerPreferences -or !$Info.independentAudioControls) { throw 'Backend is not the managed foreground fork' }
 $Manifest = [ordered]@{
   bridgeProtocol = 1
   upstreamCommit = 'ec531599dfdd02e14ce68efd8c0d2dcb439894a5'
@@ -64,6 +64,7 @@ $Manifest = [ordered]@{
   driversInstalled = $false
   singleConnectionSession = $true
   controllerPreferences = $true
+  independentAudioControls = $true
 }
 $Manifest | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputRoot 'backend-manifest.json') -Encoding UTF8
 Write-Output $InfoText

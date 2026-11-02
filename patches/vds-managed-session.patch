@@ -763,7 +763,7 @@
  
    std::thread to_bluetooth([&] {
      try {
-@@ -2156,6 +2282,21 @@
+@@ -2156,6 +2282,38 @@
    if (stop_monitor.joinable()) {
      stop_monitor.join();
    }
@@ -771,21 +771,38 @@
 +  // request_bridge_restart's cancellation once the restart flag was set.
 +  bluetooth->cancel(); // Cancels this HID handle/writer only; no radio reset.
 +  // Send final neutral reports only after the normal writer has joined.
-+  try {
-+    const auto neutral = dsbridge::neutral_output(state.output_state, state.headset_plugged);
-+    bluetooth->write_shutdown_packet(hidp_output_packet(neutral));
-+    const auto mic_close = state.output_state.build_bt_mic_report(false);
-+    bluetooth->write_shutdown_packet(hidp_output_packet(mic_close));
++  const auto shutdown_write = [&](const auto& report, const char* label,
++                                  bool apply_speaker_preference = true) {
++    try {
++      bluetooth->write_shutdown_packet(hidp_output_packet(report), apply_speaker_preference);
++      return true;
++    } catch (const std::exception &error) {
++      logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
++                 std::string("shutdown ") + label + " not confirmed: " + error.what());
++      return false;
++    }
++  };
++  // Each operation is attempted even if an earlier write failed. None is sent
++  // after the physical device is revealed to other applications by the manager.
++  const bool neutral_ok = shutdown_write(
++      dsbridge::neutral_output(state.output_state, state.headset_plugged), "neutralization");
++  const bool mic_ok = shutdown_write(state.output_state.build_bt_mic_report(false), "mic close");
++  if (neutral_ok && mic_ok) {
 +    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
 +               "shutdown neutral reports written; microphone close written");
-+  } catch (const std::exception &error) {
-+    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
-+               std::string("shutdown neutralization not confirmed: ") + error.what());
++  }
++  const bool release_ok = shutdown_write(
++      dsbridge::lighting_handoff(state.output_state, false), "LED release", false);
++  const bool native_light_ok = shutdown_write(
++      dsbridge::lighting_handoff(state.output_state, true), "native light", false);
++  if (release_ok && native_light_ok) {
++    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
++               "shutdown lighting released; native light requested");
 +  }
  }
  
  struct BridgeWorker {
-@@ -2168,6 +2309,7 @@
+@@ -2168,6 +2326,7 @@
    std::thread thread;
    std::atomic_bool stop_requested = false;
    std::atomic_bool done = false;
@@ -793,7 +810,7 @@
  };
  
  class ControlPipeServer {
-@@ -2285,8 +2427,8 @@
+@@ -2285,8 +2444,8 @@
    void thread_main() {
      while (!stop_requested_) {
        UniqueHandle pipe(CreateNamedPipeA(
@@ -804,7 +821,7 @@
            0, nullptr));
        if (!pipe) {
          logger_.log(vds::LogScope::Control, vds::LogLevel::Error,
-@@ -2310,7 +2452,7 @@
+@@ -2310,7 +2469,7 @@
                          DWORD &bytes_transferred, std::string_view label) {
      HANDLE wait_handles[2] = {overlapped.hEvent, stop_event_.get()};
      const DWORD wait_result =
@@ -813,7 +830,7 @@
      if (wait_result == WAIT_OBJECT_0 + 1) {
        CancelIoEx(pipe, &overlapped);
        (void)GetOverlappedResult(pipe, &overlapped, &bytes_transferred, TRUE);
-@@ -2447,7 +2589,9 @@
+@@ -2447,7 +2606,9 @@
      }
  
      const std::string reply = queue_command(*command);
@@ -824,7 +841,7 @@
    }
  
    vds::Logger &logger_;
-@@ -2469,13 +2613,37 @@
+@@ -2469,13 +2630,37 @@
      const std::vector<std::unique_ptr<BridgeWorker>> &workers,
      const std::string &db_path, std::uint32_t &trace_flags,
      bool &reload_requested, vds::Logger &logger) {
@@ -864,7 +881,7 @@
                      ? vds::win::usbip::endpoint_for_port(worker->port)
                      : "",
      });
-@@ -2517,6 +2685,7 @@
+@@ -2517,6 +2702,7 @@
                                    vds::Logger &logger,
                                    std::atomic_bool &stop_requested,
                                    std::atomic_bool &done,
@@ -872,7 +889,7 @@
                                    std::string &last_error,
                                    const std::atomic_uint32_t &trace_flags) {
    try {
-@@ -2526,7 +2695,7 @@
+@@ -2526,7 +2712,7 @@
      const std::string virtual_device =
          vds::win::usbip::endpoint_for_port(config.ports[0]);
      run_bridge_session(device_address, virtual_device, &config, logger,
@@ -881,7 +898,7 @@
      if (!g_stop_requested && !stop_requested.load()) {
        last_error = "bridge session ended";
        logger.log(vds::LogScope::Daemon, vds::LogLevel::Warn,
-@@ -2541,6 +2710,7 @@
+@@ -2541,6 +2727,7 @@
                       ": " + error.what());
      }
    }
@@ -889,7 +906,7 @@
    done = true;
  }
  
-@@ -2614,7 +2784,11 @@
+@@ -2614,7 +2801,11 @@
        }
      }
      if (worker_removed) {
@@ -902,7 +919,7 @@
      }
  
      if (reload_requested) {
-@@ -2640,15 +2814,14 @@
+@@ -2640,15 +2831,14 @@
          }
          const std::vector<unsigned> enabled_ports = enabled_virtual_ports();
          const bool virtual_port_provider_is_available =
@@ -920,7 +937,7 @@
              }
              logger.log(vds::LogScope::Port, vds::LogLevel::Error,
                         std::string(kVirtualPortProviderUnavailableReason) +
-@@ -2788,7 +2961,7 @@
+@@ -2788,7 +2978,7 @@
                                          &logger, worker_ptr, &trace_flags] {
              run_configured_bridge_worker(worker_config, device_address, logger,
                                           worker_ptr->stop_requested,
@@ -929,7 +946,7 @@
                                           worker_ptr->last_error, trace_flags);
              SetEvent(worker_ptr->done_event.get());
            });
-@@ -2941,6 +3114,20 @@
+@@ -2941,6 +3131,20 @@
                                 win32_error_message(GetLastError()));
      }
      g_stop_event = stop_event.get();
@@ -950,7 +967,7 @@
      if (!service_mode) {
        SetConsoleCtrlHandler(console_handler, TRUE);
      }
-@@ -2959,13 +3146,6 @@
+@@ -2959,13 +3163,6 @@
                         " detail=" + kWindowsVirtualPortProviderUnavailable);
          throw std::runtime_error(kWindowsVirtualPortProviderUnavailable);
        }
@@ -964,7 +981,7 @@
        if (service_mode) {
          update_service_status(SERVICE_RUNNING);
          logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
-@@ -3001,47 +3181,11 @@
+@@ -3001,47 +3198,11 @@
    }
  }
  
@@ -1011,22 +1028,24 @@
 -    std::cerr << "error: " << error.what() << "\n";
 -    return 1;
 +  if (argc == 2 && std::string_view(argv[1]) == "--bridge-info") {
-+    std::cout << R"({"bridgeProtocol":1,"upstreamCommit":"ec531599dfdd02e14ce68efd8c0d2dcb439894a5","managedHidHide":true,"stopEvent":true,"exclusiveUsbip":true,"serviceMode":false,"singleConnectionSession":true,"controllerPreferences":true})" << "\n";
++    std::cout << R"({"bridgeProtocol":1,"upstreamCommit":"ec531599dfdd02e14ce68efd8c0d2dcb439894a5","managedHidHide":true,"stopEvent":true,"exclusiveUsbip":true,"serviceMode":false,"singleConnectionSession":true,"controllerPreferences":true,"independentAudioControls":true})" << "\n";
 +    return 0;
    }
    return run_windows_daemon(argc, argv, false);
  }
 --- a/src/platform/win32/vds_usbip.cc
 +++ b/src/platform/win32/vds_usbip.cc
-@@ -3,6 +3,7 @@
+@@ -3,6 +3,9 @@
  // Copyright (C) 2026 Antonio <bleader93@gmail.com>
  
  #include "vds_usbip.hh"
++#include "usbip_handshake.hh"
++#include "usb_audio_controls.hh"
 +#include "usbip_hid_queue.hh"
  
  #include <algorithm>
  #include <array>
-@@ -654,19 +655,28 @@
+@@ -654,19 +657,28 @@
    std::thread pipe_reader_thread;
    std::mutex demux_mutex;
    std::condition_variable demux_cv;
@@ -1057,15 +1076,57 @@
    };
    std::thread iso_pacer_thread;
    std::mutex pacer_mutex;
-@@ -676,6 +686,7 @@
+@@ -676,12 +688,10 @@
    std::chrono::steady_clock::time_point iso_out_next_due{};
    std::chrono::steady_clock::time_point iso_in_next_due{};
    std::mutex socket_send_mutex;
 +  dsbridge::ReplyEpoch reply_epoch;
    void iso_pacer_loop();
  
-   std::atomic<int> speaker_gain_q15{1 << 15};
-@@ -880,15 +891,19 @@
+-  std::atomic<int> speaker_gain_q15{1 << 15};
+-  std::atomic<int> fu_volume_db256{0};
+-  std::atomic<bool> fu_muted{false};
+-  void update_speaker_gain();
++  dsbridge::UsbAudioControls audio_controls;
+ };
+ 
+ struct VirtualPort::Impl::Server {
+@@ -705,7 +715,10 @@
+   }
+ 
+ private:
+-  Server() : listener_thread([this] { listener_loop(); }) {
++  Server() {
++    // All members, including ready_mutex/ready_cv/startup_error, exist before
++    // the listener can touch them. Member initializer order follows declaration.
++    listener_thread = std::thread([this] { listener_loop(); });
+     std::unique_lock lock(ready_mutex);
+     ready_cv.wait(lock, [this] { return ready; });
+     if (!startup_error.empty()) {
+@@ -810,8 +823,10 @@
+   }
+ 
+   void handle_client(Socket client) {
++    // A local probe or partial request must not hold the listener or shutdown forever.
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+     OpCommonHeader header{};
+-    if (!recv_exact(client.get(), &header, sizeof(header))) {
++    if (!dsbridge::receive_handshake(client.get(), &header, sizeof(header), deadline, stop_requested)) {
+       return;
+     }
+ 
+@@ -829,8 +844,8 @@
+     }
+ 
+     std::array<char, 32> requested_busid{};
+-    if (!recv_exact(client.get(), requested_busid.data(),
+-                    requested_busid.size())) {
++    if (!dsbridge::receive_handshake(client.get(), requested_busid.data(),
++                    requested_busid.size(), deadline, stop_requested)) {
+       return;
+     }
+     const std::size_t length =
+@@ -880,15 +895,19 @@
      if (!listener.valid()) {
        error = "failed to create USB/IP listener";
      } else {
@@ -1089,7 +1150,7 @@
                 sizeof(address)) != 0) {
          error = "failed to bind USB/IP listener to 127.0.0.1:" +
                  std::to_string(kDefaultPort) + ": " +
-@@ -916,6 +931,11 @@
+@@ -916,6 +935,11 @@
                             reinterpret_cast<sockaddr *>(&client_address),
                             &client_address_size));
        if (!client.valid()) {
@@ -1101,7 +1162,7 @@
          continue;
        }
        if (stop_requested.load()) {
-@@ -1036,7 +1056,9 @@
+@@ -1036,7 +1060,9 @@
        std::lock_guard<std::mutex> send_guard(socket_send_mutex);
        // Failure just means the client went away; the session loop notices
        // on its own recv path, nothing to do here.
@@ -1112,16 +1173,31 @@
      }
      lk.lock();
    }
-@@ -1060,6 +1082,8 @@
+@@ -1045,21 +1071,9 @@
+   }
  }
  
+-void VirtualPort::Impl::update_speaker_gain() {
+-  if (fu_muted.load()) {
+-    speaker_gain_q15 = 0;
+-    return;
+-  }
+-  const double db = static_cast<double>(fu_volume_db256.load()) / 256.0;
+-  double linear = std::pow(10.0, db / 20.0);
+-  if (linear > 1.0)
+-    linear = 1.0;
+-  if (linear < 0.0)
+-    linear = 0.0;
+-  speaker_gain_q15 = static_cast<int>(linear * (1 << 15) + 0.5);
+-}
+-
  void VirtualPort::Impl::handle_import_session(SOCKET client) {
 +  logger.log(LogScope::Usb, LogLevel::Info,
 +             "USB/IP low-latency socket: TCP_NODELAY=on; contiguous replies; asynchronous HID input");
    const ProfileDescriptors desc = descriptors_for_profile(profile);
  
    OpCommonHeader reply{
-@@ -1090,9 +1114,31 @@
+@@ -1090,9 +1104,31 @@
      return;
    }
  
@@ -1153,7 +1229,7 @@
      try {
        std::lock_guard<std::mutex> guard(pacer_mutex);
        paced_replies.clear();
-@@ -1157,12 +1203,24 @@
+@@ -1157,12 +1193,24 @@
            ntoh32(static_cast<std::uint32_t>(cmd.number_of_packets)));
  
        if (cmd.base.command == kCmdUnlink) {
@@ -1183,7 +1259,7 @@
          unlink_reply.base.command = hton32(kRetUnlink);
          unlink_reply.base.seqnum = hton32(cmd.base.seqnum);
          {
-@@ -1292,12 +1350,10 @@
+@@ -1292,12 +1340,10 @@
      std::lock_guard<std::mutex> lk(demux_mutex);
      switch (frame.header.type) {
      case VDS_FRAME_USB_HID_IN:
@@ -1200,7 +1276,7 @@
        break;
      case VDS_FRAME_USB_FEATURE_REPLY:
        feature_reply_queue.push_back(std::move(frame));
-@@ -1323,18 +1379,30 @@
+@@ -1323,18 +1369,30 @@
    }
  }
  
@@ -1243,7 +1319,65 @@
  }
  
  bool VirtualPort::Impl::wait_for_feature_reply(Frame &out, DWORD timeout_ms) {
-@@ -1572,11 +1640,12 @@
+@@ -1513,53 +1571,10 @@
+                (bmRequestType & 0x1f) == 0x01 &&
+                (bRequest == 0x81 || bRequest == 0x82 || bRequest == 0x83 ||
+                 bRequest == 0x84 || bRequest == 0x01)) {
+-      // USB Audio Class 1.0 Feature Unit control request (GET_CUR/MIN/MAX/RES
+-      // or SET_CUR) targeting a control selector (wValue hi byte) on an
+-      // entity (wIndex hi byte). usbaudio.sys queries these (typically
+-      // MUTE_CONTROL=0x01, VOLUME_CONTROL=0x02) during IRP_MN_START_DEVICE;
+-      // a compliant device must answer rather than STALL, or the class
+-      // driver fails to start. We don't have a real mixer to back these, so
+-      // just report sane fixed values (unmuted, 0dB, wide min/max range).
+-      const std::uint8_t control_selector =
+-          static_cast<std::uint8_t>((wValue >> 8) & 0xff);
+-      const bool is_mute = control_selector == 0x01;
+-      const bool is_volume = control_selector == 0x02;
+-      if (device_to_host && (is_mute || is_volume)) {
+-        if (is_mute) {
+-          reply_data.assign(
+-              {fu_muted.load() ? std::uint8_t{0x01} : std::uint8_t{0x00}});
+-        } else if (bRequest == 0x82) { // GET_MIN
+-          reply_data.assign(
+-              {0x01, 0xda});           // -100.00 dB (0xDA01, 1/256 dB units)
+-        } else if (bRequest == 0x83) { // GET_MAX
+-          reply_data.assign({0x00, 0x00}); // 0.00 dB
+-        } else if (bRequest == 0x84) {     // GET_RES
+-          reply_data.assign({0x01, 0x00}); // 1/256 dB step
+-        } else { // GET_CUR -- report the value the host last set
+-          const auto cur = static_cast<std::uint16_t>(
+-              static_cast<std::int16_t>(fu_volume_db256.load()));
+-          reply_data.assign({static_cast<std::uint8_t>(cur & 0xff),
+-                             static_cast<std::uint8_t>((cur >> 8) & 0xff)});
+-        }
+-        const std::size_t copy_len =
+-            std::min<std::size_t>(reply_data.size(), wLength);
+-        reply_data.resize(copy_len);
+-      } else if (!device_to_host && bRequest == 0x01) {
+-        // SET_CUR: actually apply it (previously accepted and discarded,
+-        // which left the Windows volume slider nonfunctional and audio
+-        // pinned at full scale). Payload arrives in the control OUT data
+-        // stage (out_data).
+-        if (is_mute && !out_data.empty()) {
+-          fu_muted = out_data[0] != 0;
+-          update_speaker_gain();
+-        } else if (is_volume && out_data.size() >= 2) {
+-          fu_volume_db256 = static_cast<std::int16_t>(
+-              static_cast<std::uint16_t>(out_data[0]) |
+-              (static_cast<std::uint16_t>(out_data[1]) << 8));
+-          update_speaker_gain();
+-        }
+-      }
+-      ret.status = 0;
++      const auto result = audio_controls.control(bmRequestType, bRequest,
++          wValue, wIndex, wLength, out_data);
++      reply_data.assign(result.bytes.begin(), result.bytes.begin() + result.length);
++      ret.status = result.supported ? 0 : -32;
+     } else {
+       // Unhandled/unknown control request: STALL.
+       ret.status = -32; // -EPIPE
+@@ -1572,11 +1587,12 @@
        reply_data.resize(wLength);
      }
    } else if (cmd.base.ep == kEpHidIn && cmd.base.direction == kDirIn) {
@@ -1261,7 +1395,42 @@
    } else if (cmd.base.ep == kEpHidOut && cmd.base.direction == kDirOut) {
      write_daemon_frame(pipe_server.get(), VDS_FRAME_USB_HID_OUT, out_data);
      ret.status = 0;
-@@ -1705,6 +1774,7 @@
+@@ -1589,24 +1605,12 @@
+     // Apply the host-set Feature Unit volume to the speaker channels
+     // (ch0/1) only; ch2/3 are haptics and must not follow system volume.
+     // 4-channel 16-bit interleaved: 8 bytes per frame.
+-    const int gain_q15 = speaker_gain_q15.load();
++    const int gain_q15 = audio_controls.speaker_gain();
+     std::vector<std::uint8_t> gained;
+     std::span<const std::uint8_t> pcm_to_forward = out_data;
+     if (gain_q15 != (1 << 15)) {
+       gained.assign(out_data.begin(), out_data.end());
+-      for (std::size_t off = 0; off + 8 <= gained.size(); off += 8) {
+-        for (std::size_t ch = 0; ch < 2; ++ch) {
+-          const std::size_t idx = off + ch * 2;
+-          const auto sample = static_cast<std::int16_t>(
+-              static_cast<std::uint16_t>(gained[idx]) |
+-              (static_cast<std::uint16_t>(gained[idx + 1]) << 8));
+-          const int scaled = (static_cast<int>(sample) * gain_q15) >> 15;
+-          const auto clamped = static_cast<std::int16_t>(
+-              scaled > 32767 ? 32767 : (scaled < -32768 ? -32768 : scaled));
+-          gained[idx] = static_cast<std::uint8_t>(clamped & 0xff);
+-          gained[idx + 1] = static_cast<std::uint8_t>((clamped >> 8) & 0xff);
+-        }
+-      }
++      dsbridge::scale_audio_channels(gained, gain_q15, false);
+       pcm_to_forward = gained;
+     }
+     write_daemon_frame(pipe_server.get(), VDS_FRAME_USB_AUDIO_OUT,
+@@ -1631,6 +1635,7 @@
+     // that interval.
+     reply_data =
+         take_mic_bytes(static_cast<std::size_t>(cmd.transfer_buffer_length));
++    dsbridge::scale_audio_channels(reply_data, audio_controls.microphone_gain(), true);
+     ret.status = 0;
+     ret.number_of_packets = cmd.number_of_packets;
+   } else {
+@@ -1705,6 +1710,7 @@
                         cmd.number_of_packets > 0;
    if (pace_out || pace_in) {
      PacedReply paced{};
@@ -1269,7 +1438,7 @@
      paced.client = client;
      const std::size_t data_len = pace_in ? reply_data.size() : 0;
      const std::size_t iso_len =
-@@ -1735,25 +1805,17 @@
+@@ -1735,25 +1741,17 @@
      return true;
    }
  
@@ -1324,7 +1493,7 @@
      if (!force && !output_diagnostic_pending_) {
        return std::nullopt;
      }
-@@ -430,28 +431,73 @@
+@@ -430,28 +431,75 @@
        return std::nullopt;
      }
  
@@ -1381,7 +1550,8 @@
 +
 +  // Used only after every producer and the normal writer have joined.
 +  // It has its own completion event because the normal stop event is latched.
-+  void write_shutdown_packet(std::span<const std::uint8_t> packet) override {
++  void write_shutdown_packet(std::span<const std::uint8_t> packet,
++                             bool apply_speaker_preference = true) override {
 +    if (packet.empty() || packet[0] != kBtHidpOutputPrefix)
 +      throw std::runtime_error("invalid shutdown HID packet");
 +    {
@@ -1394,7 +1564,8 @@
 +    if (!event) throw std::runtime_error("shutdown completion event failed");
 +    OVERLAPPED op{};
 +    op.hEvent = event.get();
-+    dsbridge::mute_speaker_report(std::span(write.buffer).first(write.report_size),dsbridge::speaker_muted.load());
++    if (apply_speaker_preference)
++      dsbridge::mute_speaker_report(std::span(write.buffer).first(write.report_size),dsbridge::speaker_muted.load());
 +    if (!WriteFile(output_handle_.get(), write.buffer.data(),
 +                   static_cast<DWORD>(write.buffer.size()), nullptr, &op) &&
 +        GetLastError() != ERROR_IO_PENDING)
@@ -1413,7 +1584,7 @@
    }
  
    void cancel() override {
-@@ -468,6 +514,7 @@
+@@ -468,6 +516,7 @@
  private:
    struct QueuedOutputWrite {
      std::vector<std::uint8_t> buffer;
@@ -1421,7 +1592,7 @@
    };
  
    static UniqueHandle open_hid_device(const std::string &path,
-@@ -676,7 +723,7 @@
+@@ -676,7 +725,7 @@
      }
      std::vector<std::uint8_t> buffer(output_report_length_);
      std::copy(report.begin(), report.end(), buffer.begin());
@@ -1430,7 +1601,7 @@
    }
  
    bool enqueue_output_report(std::span<const std::uint8_t> report) {
-@@ -770,6 +817,7 @@
+@@ -770,6 +819,7 @@
        }
  
        try {
@@ -1444,7 +1615,7 @@
      (void)force;
      return std::nullopt;
    }
-+  virtual void write_shutdown_packet(std::span<const std::uint8_t> packet) = 0;
++  virtual void write_shutdown_packet(std::span<const std::uint8_t> packet, bool apply_speaker_preference = true) = 0;
    virtual void cancel() = 0;
    virtual std::string description() const = 0;
  };
@@ -1594,13 +1765,14 @@
    endif()
  endif()
 +
-+add_executable(dsbridge_runtime_tests src/dsbridge_runtime_tests.cc src/dsbridge_diagnostic_tests.cc)
-+target_link_libraries(dsbridge_runtime_tests PRIVATE vds_protocol vds_log ${VDS_OPUS_TARGET})
++add_executable(dsbridge_runtime_tests src/dsbridge_runtime_tests.cc src/dsbridge_diagnostic_tests.cc src/dsbridge_audio_tests.cc src/dsbridge_handshake_tests.cc)
++target_link_libraries(dsbridge_runtime_tests PRIVATE vds_protocol vds_log ${VDS_OPUS_TARGET} ws2_32)
 --- /dev/null
 +++ b/src/bridge_runtime.hh
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,65 @@
 +// SPDX-License-Identifier: MIT
 +#pragma once
++#include <algorithm>
 +#include <chrono>
 +#include <deque>
 +#include "vds_protocol.hh"
@@ -1634,8 +1806,9 @@
 +  }
 +};
 +
-+// Preserve light/mic-button preferences; release forces and stop bridge-owned audio.
-+// The caller also closes the microphone stream using the existing protocol builder.
++// Release forces and stop bridge-owned audio without undoing the user's mic mute.
++// This is intermediate: the caller closes the microphone and hands lighting back
++// to firmware after all ordinary writers have stopped.
 +inline vds::BtStateReport neutral_output(vds::DsOutputState& state, bool headset) {
 +  std::array<std::uint8_t,48> usb{};
 +  usb[0]=VDS_USB_OUTPUT_REPORT_ID;
@@ -1643,6 +1816,23 @@
 +  state.set_audio_out_stream_active(false,headset);
 +  state.apply_usb_output_report(usb);
 +  return state.build_bt_state_report();
++}
++
++// Terminal reports only: release the host lighting, then enable the firmware's
++// native Bluetooth light. Never replay the retained yellow/custom RGB or audio
++// controls here. The transport must bypass the speaker-preference filter for
++// these reports; that filter would otherwise add audio/mute writes.
++inline vds::BtStateReport lighting_handoff(vds::DsOutputState& state, bool native_light) {
++  auto report=state.build_bt_state_report(); // Retain the next sequence/header.
++  std::fill(report.begin()+3,report.end(),std::uint8_t{0});
++  if(native_light) {
++    report[41]=0x02; // Lightbar setup enable.
++    report[44]=0x01; // Firmware light on, not a custom RGB value.
++  } else {
++    report[4]=0x18; // Release host LEDs and clear bridge/game player indicators.
++  }
++  vds::fill_output_report_checksum(report);
++  return report;
 +}
 +}
 --- /dev/null
@@ -1679,6 +1869,100 @@
 +  report[offset+9]|=0x20;
 +  if(changed)vds::fill_output_report_checksum(report);
 +  return changed;
++}
++}
+--- /dev/null
++++ b/src/usb_audio_controls.hh
+@@ -0,0 +1,91 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <span>
++
++namespace dsbridge {
++struct AudioControlReply {
++  bool supported = false;
++  std::array<std::uint8_t, 2> bytes{};
++  std::size_t length = 0;
++};
++
++// UAC1 topology stays unchanged: interface 0, playback FU 2, capture FU 5.
++// Only the master channel advertises mute and volume in the pinned descriptor.
++class UsbAudioControls {
++  struct Unit {
++    bool muted = false;
++    std::int16_t volume = 0;
++    std::atomic<int> gain{32768};
++    void update() {
++      gain = muted ? 0 : static_cast<int>(std::pow(10.0, volume / 256.0 / 20.0) * 32768 + .5);
++    }
++  } speaker_, microphone_;
++public:
++  // Preserve the actual range advertised by the existing backend (about -38 dB).
++  static constexpr std::int16_t minimum = -9727;
++  AudioControlReply control(std::uint8_t type, std::uint8_t request,
++      std::uint16_t value, std::uint16_t index, std::uint16_t length,
++      std::span<const std::uint8_t> data) {
++    AudioControlReply reply;
++    if ((type != 0x21 && type != 0xa1) || (index & 0xff) != 0 || (value & 0xff) != 0) return reply;
++    const auto entity = index >> 8;
++    Unit* unit = entity == 2 ? &speaker_ : entity == 5 ? &microphone_ : nullptr;
++    const auto selector = value >> 8;
++    if (!unit || (selector != 1 && selector != 2)) return reply;
++    const std::size_t size = selector == 1 ? 1 : 2;
++    if (type == 0x21) {
++      if (request != 1 || length != size || data.size() != size) return reply;
++      if (selector == 1) {
++        if (data[0] > 1) return reply;
++        unit->muted = data[0] != 0;
++      } else {
++        const auto db = static_cast<std::int16_t>(static_cast<std::uint16_t>(data[0]) | (static_cast<std::uint16_t>(data[1]) << 8));
++        unit->volume = std::clamp(db, minimum, static_cast<std::int16_t>(0));
++      }
++      unit->update();
++    } else {
++      if (!data.empty() || length == 0) return reply;
++      std::int16_t result = 0;
++      if (selector == 1) {
++        if (request != 0x81) return reply;
++        result = unit->muted ? 1 : 0;
++      } else {
++        switch (request) {
++          case 0x81: result = unit->volume; break;
++          case 0x82: result = minimum; break;
++          case 0x83: result = 0; break;
++          case 0x84: result = 1; break;
++          default: return reply;
++        }
++      }
++      const auto bits = static_cast<std::uint16_t>(result);
++      reply.bytes = {static_cast<std::uint8_t>(bits), static_cast<std::uint8_t>(bits >> 8)};
++      reply.length = std::min<std::size_t>(length, size);
++    }
++    reply.supported = true;
++    return reply;
++  }
++  int speaker_gain() const { return speaker_.gain.load(); }
++  int microphone_gain() const { return microphone_.gain.load(); }
++};
++
++// The gain changes samples only. No stream state, packet timing or format changes.
++inline void scale_audio_channels(std::span<std::uint8_t> pcm, int gain, bool capture) {
++  if (gain == 32768) return;
++  const std::size_t frame_bytes = capture ? 4 : 8;
++  for (std::size_t off = 0; off + frame_bytes <= pcm.size(); off += frame_bytes) {
++    for (std::size_t ch = 0; ch < 2; ++ch) {
++      const auto idx = off + ch * 2;
++      const auto sample = static_cast<std::int16_t>(static_cast<std::uint16_t>(pcm[idx]) | (static_cast<std::uint16_t>(pcm[idx + 1]) << 8));
++      const auto scaled = static_cast<std::int16_t>((static_cast<int>(sample) * gain) >> 15);
++      pcm[idx] = static_cast<std::uint8_t>(scaled);
++      pcm[idx + 1] = static_cast<std::uint8_t>(static_cast<std::uint16_t>(scaled) >> 8);
++    }
++  }
 +}
 +}
 --- /dev/null
@@ -1852,8 +2136,46 @@
 +};
 +} // namespace dsbridge
 --- /dev/null
++++ b/src/usbip_handshake.hh
+@@ -0,0 +1,35 @@
++// SPDX-License-Identifier: MIT
++#pragma once
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <winsock2.h>
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <climits>
++#include <cstddef>
++
++namespace dsbridge {
++// Only the pre-import header/busid uses this deadline. Once imported, the existing
++// HID/ISO receive path is untouched. The listener is the sole reader of this socket.
++inline bool receive_handshake(SOCKET socket,void* destination,std::size_t length,
++    std::chrono::steady_clock::time_point deadline,const std::atomic_bool& stopping) {
++  auto* bytes=static_cast<char*>(destination);
++  while(length) {
++    if(stopping.load())return false;
++    auto remaining=std::chrono::duration_cast<std::chrono::microseconds>(deadline-std::chrono::steady_clock::now());
++    if(remaining.count()<=0)return false;
++    auto slice=std::min(remaining,std::chrono::microseconds(25000));
++    timeval wait{0,static_cast<long>(slice.count())};
++    fd_set ready;FD_ZERO(&ready);FD_SET(socket,&ready);
++    const auto available=select(0,&ready,nullptr,nullptr,&wait);
++    if(available==SOCKET_ERROR)return false;
++    if(available==0)continue;
++    const int count=recv(socket,bytes,static_cast<int>(std::min<std::size_t>(length,INT_MAX)),0);
++    if(count<=0)return false;
++    bytes+=count;length-=static_cast<std::size_t>(count);
++  }
++  return !stopping.load()&&std::chrono::steady_clock::now()<=deadline;
++}
++}
+--- /dev/null
 +++ b/src/dsbridge_runtime_tests.cc
-@@ -0,0 +1,121 @@
+@@ -0,0 +1,154 @@
 +// SPDX-License-Identifier: MIT
 +#include <iostream>
 +#include <stdexcept>
@@ -1862,8 +2184,38 @@
 +#include "controller_preferences.hh"
 +using namespace std::chrono_literals;
 +void test_diagnostics();
++void test_audio_controls();
++void test_handshake();
 +void require(bool value, const char* why) {
 +  if(!value) throw std::runtime_error(why);
++}
++void test_lighting_handoff() {
++  vds::DsOutputState state;
++  std::array<std::uint8_t,48> game{};game.fill(0x55);
++  game[0]=2;game[1]=0xff;game[2]=0xf7;
++  require(state.apply_usb_output_report(game),"lighting test setup failed");
++  const auto retained=state.state();
++  const auto release=dsbridge::lighting_handoff(state,false);
++  const auto native=dsbridge::lighting_handoff(state,true);
++  require(state.state()==retained,"terminal light handoff altered active/game state");
++  require(release[0]==0x31&&release[2]==0x10&&native[0]==0x31&&native[2]==0x10,
++          "light handoff lost Bluetooth framing");
++  require(native[1]==static_cast<std::uint8_t>((release[1]+0x10)&0xf0),
++          "light handoff reused the output sequence");
++  require(release[4]==0x18&&release[46]==0,"host/player LEDs were not released");
++  require(native[41]==2&&native[44]==1&&native[4]==0,
++          "firmware native lighting was not requested independently of RGB");
++  for(std::size_t i=3;i<74;++i) {
++    if(i!=4)require(release[i]==0,"LED release leaked an audio, force or RGB field");
++    if(i!=41&&i!=44)require(native[i]==0,"native light handoff leaked retained game fields");
++  }
++  for(auto report:{release,native}) {
++    auto crc=report;vds::fill_output_report_checksum(crc);
++    require(crc==report,"light handoff CRC invalid");
++  }
++  const auto repeated=dsbridge::lighting_handoff(state,true);
++  require(std::equal(native.begin()+2,native.begin()+74,repeated.begin()+2),
++          "repeated light handoff changed its effect");
 +}
 +void test_speaker_preference() {
 +  require(dsbridge::speaker_muted.load(),"controller speaker must default to muted");
@@ -1906,7 +2258,10 @@
 +int main() {
 +  try {
 +    test_speaker_preference();
++    test_lighting_handoff();
 +    test_diagnostics();
++    test_audio_controls();
++    test_handshake();
 +    dsbridge::ReplyEpoch epoch;
 +    require(!epoch.accepts(epoch.current()),"inactive session accepts a reply");
 +    const auto first_session=epoch.activate();
@@ -2104,4 +2459,132 @@
 +          contents.find("diagnostic logging loss dropped=") != std::string::npos,
 +          "logger drain, escaping, reopen or oversize accounting failed");
 +  std::cout << "diagnostic checks passed: blocked sink isolation, bounded FIFO, loss accounting, concurrent producers, stop/drain, sink failure, critical/recovery logs, reopen\n";
++}
+--- /dev/null
++++ b/src/dsbridge_audio_tests.cc
+@@ -0,0 +1,58 @@
++// SPDX-License-Identifier: MIT
++#include "usb_audio_controls.hh"
++#include <stdexcept>
++#include <iostream>
++namespace {
++void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
++}
++void test_audio_controls() {
++  dsbridge::UsbAudioControls a;
++  const std::array<std::uint8_t,1> mute{1}, unmute{0};
++  const std::array<std::uint8_t,2> minus6{0,0xfa}, unity{0,0};
++  check(a.speaker_gain()==32768 && a.microphone_gain()==32768,"default gains changed");
++  check(a.control(0x21,1,0x100,0x500,1,mute).supported,"mic master mute rejected");
++  check(a.microphone_gain()==0 && a.speaker_gain()==32768,"mic mute leaked into playback");
++  check(a.control(0xa1,0x81,0x100,0x200,1,{}).bytes[0]==0,"playback mute read contaminated");
++  check(a.control(0xa1,0x81,0x100,0x500,1,{}).bytes[0]==1,"capture mute not retained");
++  check(a.control(0x21,1,0x200,0x200,2,minus6).supported,"playback volume rejected");
++  check(a.speaker_gain()>16000 && a.speaker_gain()<17000 && a.microphone_gain()==0,"volume isolation failed");
++  check(a.control(0x21,1,0x100,0x500,1,unmute).supported && a.microphone_gain()==32768,"capture unmute failed");
++  check(a.control(0x21,1,0x100,0x200,1,mute).supported && a.microphone_gain()==32768,"playback mute affected capture");
++  check(a.control(0x21,1,0x200,0x500,2,minus6).supported && a.speaker_gain()==0,"capture volume affected playback");
++  const auto min=a.control(0xa1,0x82,0x200,0x200,2,{});
++  check(min.supported && min.bytes[0]==1 && min.bytes[1]==0xda,"advertised volume range changed");
++  check(a.control(0xa1,0x84,0x200,0x500,2,{}).bytes[0]==1,"volume resolution changed");
++  check(a.control(0xa1,0x81,0x200,0x500,1,{}).length==1,"short control IN exceeded wLength");
++  for (auto index : {0x000,0x100,0x300,0x201,0x501})
++    check(!a.control(0x21,1,0x100,index,1,unmute).supported,"unknown entity/interface accepted");
++  for (auto value : {0x101,0x201,0x300})
++    check(!a.control(0x21,1,value,0x200,1,unmute).supported,"unsupported selector/channel accepted");
++  check(!a.control(0x21,1,0x200,0x200,1,unmute).supported,"short volume payload accepted");
++  check(!a.control(0x21,1,0x100,0x200,1,unity).supported,"oversize mute accepted");
++  check(!a.control(0xa1,0x82,0x100,0x200,1,{}).supported,"undefined mute GET_MIN accepted");
++  check(!a.control(0x22,1,0x100,0x200,1,unmute).supported,"endpoint recipient accepted as feature unit");
++  check(a.speaker_gain()==0,"rejected command changed state");
++  // All PCM16 values in both speaker channels: haptic bytes must remain bit exact.
++  for (int gain : {0,1,16423,32768}) {
++    for (int sample=-32768;sample<=32767;++sample) {
++      const auto bits=static_cast<std::uint16_t>(sample);
++      const auto other = static_cast<std::int16_t>(-1-sample);
++      const auto other_bits = static_cast<std::uint16_t>(other);
++      std::array<std::uint8_t,8> pcm{static_cast<std::uint8_t>(bits),static_cast<std::uint8_t>(bits>>8),
++          static_cast<std::uint8_t>(other_bits),static_cast<std::uint8_t>(other_bits>>8),
++          static_cast<std::uint8_t>(bits),static_cast<std::uint8_t>(bits>>8),
++          static_cast<std::uint8_t>(other_bits),static_cast<std::uint8_t>(other_bits>>8)};
++      const auto original=pcm;
++      dsbridge::scale_audio_channels(pcm,gain,false);
++      const auto expected=static_cast<std::int16_t>((sample*gain)>>15);
++      check(pcm[0]==static_cast<std::uint8_t>(expected) && pcm[1]==static_cast<std::uint8_t>(static_cast<std::uint16_t>(expected)>>8),"speaker PCM regression");
++      const auto expected_other=static_cast<std::int16_t>((other*gain)>>15);
++      check(pcm[2]==static_cast<std::uint8_t>(expected_other) && pcm[3]==static_cast<std::uint8_t>(static_cast<std::uint16_t>(expected_other)>>8),"second speaker channel regression");
++      check(std::equal(pcm.begin()+4,pcm.end(),original.begin()+4),"haptic samples modified");
++    }
++  }
++  std::array<std::uint8_t,5> capture{0xff,0x7f,0,0x80,0xab};
++  dsbridge::scale_audio_channels(capture,0,true);
++  check(capture==std::array<std::uint8_t,5>{0,0,0,0,0xab},"capture mute or incomplete frame handling failed");
++  std::cout<<"audio control checks passed: entity/channel validation, independent gains, unchanged range, exhaustive PCM/haptic preservation\n";
++}
+--- /dev/null
++++ b/src/dsbridge_handshake_tests.cc
+@@ -0,0 +1,64 @@
++// SPDX-License-Identifier: MIT
++#include "usbip_handshake.hh"
++#include <array>
++#include <stdexcept>
++#include <thread>
++#include <iostream>
++using namespace std::chrono_literals;
++namespace {
++void verify(bool value,const char* why){if(!value)throw std::runtime_error(why);}
++struct SocketPair {
++  SOCKET listener=INVALID_SOCKET,client=INVALID_SOCKET,server=INVALID_SOCKET;
++  SocketPair() {
++    try {
++      listener=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
++      verify(listener!=INVALID_SOCKET,"fixture listener creation");
++      sockaddr_in address{};address.sin_family=AF_INET;address.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
++      verify(bind(listener,reinterpret_cast<sockaddr*>(&address),sizeof(address))==0,"fixture bind");
++      verify(listen(listener,1)==0,"fixture listen");int size=sizeof(address);
++      verify(getsockname(listener,reinterpret_cast<sockaddr*>(&address),&size)==0,"fixture ephemeral port");
++      client=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
++      verify(client!=INVALID_SOCKET&&connect(client,reinterpret_cast<sockaddr*>(&address),sizeof(address))==0,"fixture connect");
++      server=accept(listener,nullptr,nullptr);verify(server!=INVALID_SOCKET,"fixture accept");
++      closesocket(listener);listener=INVALID_SOCKET;
++    }catch(...){close();throw;}
++  }
++  void close(){for(auto* s:{&listener,&client,&server})if(*s!=INVALID_SOCKET){closesocket(*s);*s=INVALID_SOCKET;}}
++  ~SocketPair(){close();}
++};
++}
++void test_handshake() {
++  WSADATA data{};verify(WSAStartup(MAKEWORD(2,2),&data)==0,"fixture Winsock startup");
++  struct WinsockCleanup{~WinsockCleanup(){WSACleanup();}} cleanup;
++  std::atomic_bool stopping=false;std::array<char,40> bytes{};
++  {
++    SocketPair pair;auto start=std::chrono::steady_clock::now();
++    verify(!dsbridge::receive_handshake(pair.server,bytes.data(),8,start+50ms,stopping),"silent peer accepted");
++    verify(std::chrono::steady_clock::now()-start<1s,"silent peer blocked beyond deadline");
++  }
++  {
++    SocketPair pair;auto start=std::chrono::steady_clock::now();
++    std::jthread writer([&](std::stop_token token){while(!token.stop_requested()){if(send(pair.client,"x",1,0)!=1)return;std::this_thread::sleep_for(10ms);}});
++    verify(!dsbridge::receive_handshake(pair.server,bytes.data(),bytes.size(),start+75ms,stopping),"slow trickle reset absolute deadline");
++    writer.request_stop();writer.join();
++    verify(std::chrono::steady_clock::now()-start<1s,"slow trickle stalled listener");
++  }
++  {
++    SocketPair pair;auto start=std::chrono::steady_clock::now();
++    std::jthread stopper([&]{std::this_thread::sleep_for(20ms);stopping=true;});
++    const bool received=dsbridge::receive_handshake(pair.server,bytes.data(),8,start+5s,stopping);
++    stopper.join();verify(!received&&std::chrono::steady_clock::now()-start<1s,"listener stop did not interrupt handshake");
++    stopping=false;
++  }
++  {
++    SocketPair pair;std::array<char,40> expected;for(std::size_t i=0;i<expected.size();++i)expected[i]=static_cast<char>(i);
++    std::jthread writer([&]{send(pair.client,expected.data(),3,0);std::this_thread::sleep_for(5ms);send(pair.client,expected.data()+3,37,0);});
++    const auto deadline=std::chrono::steady_clock::now()+2s;
++    const bool header=dsbridge::receive_handshake(pair.server,bytes.data(),8,deadline,stopping);
++    const bool busid=dsbridge::receive_handshake(pair.server,bytes.data()+8,32,deadline,stopping);
++    writer.join();verify(header&&busid&&bytes==expected,"valid fragmented handshake changed");
++    shutdown(pair.client,SD_SEND);
++    verify(!dsbridge::receive_handshake(pair.server,bytes.data(),1,deadline,stopping),"closed peer accepted");
++  }
++  std::cout<<"handshake checks passed: fragmented headers, silent peer, slow trickle, peer EOF, interruptible stop (ephemeral loopback only)\n";
 +}

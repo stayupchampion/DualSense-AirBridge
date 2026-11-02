@@ -29,22 +29,12 @@ internal static class Paths {
         return full;
     }
 }
-internal static class Run {
+internal static partial class Run {
     public static ProcessStartInfo Info(string exe, params string[] args) {
         var info = new ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardError = true, RedirectStandardOutput = true, WorkingDirectory = Paths.Root };
         foreach (var arg in args) info.ArgumentList.Add(arg);
         return info;
-    }
-    public static async Task<string> Text(string exe, string[] args, int timeout = 8000) {
-        using var proc = Process.Start(Info(exe, args)) ?? throw new InvalidOperationException("无法启动 " + Path.GetFileName(exe));
-        var stdout = proc.StandardOutput.ReadToEndAsync();
-        var stderr = proc.StandardError.ReadToEndAsync();
-        try { await proc.WaitForExitAsync().WaitAsync(TimeSpan.FromMilliseconds(timeout)); }
-        catch { try { proc.Kill(); } catch {} throw new TimeoutException(Path.GetFileName(exe) + " 响应超时"); }
-        var output = await stdout; var error = await stderr;
-        if (proc.ExitCode != 0) throw new InvalidOperationException(Path.GetFileName(exe) + " 失败: " + error + output);
-        return output;
     }
     public static bool IsAlive(int pid, long ticks) {
         try { using var p = Process.GetProcessById(pid); return !p.HasExited && p.StartTime.ToUniversalTime().Ticks == ticks; }
@@ -52,24 +42,28 @@ internal static class Run {
     }
 }
 internal sealed class HidHide : IHideAccess {
+    readonly CancellationToken cancel;
+    readonly Func<string[],CancellationToken,Task<string>> execute;
+    public HidHide(CancellationToken cancel=default,Func<string[],CancellationToken,Task<string>>? execute=null) {
+        this.cancel=cancel;this.execute=execute??((args,token)=>Run.Text(Paths.HideCli,args,cancel:token));
+    }
     private async Task<string> Cmd(params string[] args) {
         for(int attempt=0;;attempt++) {
-            try { return await Run.Text(Paths.HideCli,args); }
+            cancel.ThrowIfCancellationRequested();
+            try { return await execute(args,cancel); }
             // HidHide's control handle is exclusive. Its own configuration utility or a
             // concurrent read-only diagnostic can briefly hold it; retry only open-denied.
             catch(InvalidOperationException ex) when(attempt<4 &&
                 ex.Message.Contains("0x0005",StringComparison.OrdinalIgnoreCase)) {
-                await Task.Delay(125*(attempt+1));
+                await Task.Delay(125*(attempt+1),cancel);
             }
         }
     }
     public async Task<HideState> Read() {
-        // Separate calls make parser errors explicit; never infer missing output as "off".
-        var active = HideParser.Flag(await Cmd("--cloak-state"), "cloak");
-        var inverse = HideParser.Flag(await Cmd("--inv-state"), "inv");
-        var devices = HideParser.Entries(await Cmd("--dev-list"), "--dev-hide");
-        var applications = HideParser.Entries(await Cmd("--app-list"), "--app-reg");
-        return new(active, inverse, devices, applications);
+        // v1.5.230.0 supports multiple commands sharing one loaded configuration.
+        // --cancel avoids the CLI's final ApplyConfigurationChanges on observation.
+        return HideParser.Snapshot(await Cmd("--cloak-state","--inv-state","--dev-list","--app-list",
+            "--cloak-state","--inv-state","--cancel"));
     }
     public async Task Register(string path) => _ = await Cmd("--app-reg", path);
     public async Task Unregister(string path) => _ = await Cmd("--app-unreg", path);
@@ -84,17 +78,22 @@ internal sealed record ProbeReport(DateTimeOffset CheckedAt, string Windows, boo
 }
 internal static class Probe {
     public static async Task<ProbeReport> Read() {
+        await using var worker=new AudioWorker(readOnly:true);
+        return await Read(()=>worker.Snapshot());
+    }
+    public static async Task<ProbeReport> Read(Func<Task<AudioState>> readAudio,CancellationToken cancel=default) {
         var blockers = new List<string>(); var notes = new List<string>();
         bool backend = false;
         if (File.Exists(Paths.Backend)) {
             try {
-                using var j = JsonDocument.Parse(await Run.Text(Paths.Backend, ["--bridge-info"]));
+                using var j = JsonDocument.Parse(await Run.Text(Paths.Backend, ["--bridge-info"],cancel:cancel));
                 var r = j.RootElement;
                 backend = r.GetProperty("bridgeProtocol").GetInt32() == 1 &&
                     r.GetProperty("managedHidHide").GetBoolean() && r.GetProperty("stopEvent").GetBoolean() &&
                     r.GetProperty("exclusiveUsbip").GetBoolean() &&
                     r.TryGetProperty("singleConnectionSession",out var singleSession) && singleSession.GetBoolean() &&
-                    r.TryGetProperty("controllerPreferences",out var preferences) && preferences.GetBoolean();
+                    r.TryGetProperty("controllerPreferences",out var preferences) && preferences.GetBoolean() &&
+                    r.TryGetProperty("independentAudioControls",out var audioControls) && audioControls.GetBoolean();
                 if (!backend) blockers.Add("桥接后端缺少安全会话补丁。");
             } catch (Exception ex) { blockers.Add("后端校验失败：" + ex.Message); }
         } else blockers.Add("缺少已编译的 backend/vdsd.exe。");
@@ -124,14 +123,14 @@ internal static class Probe {
             if(virtualController)blockers.Add("检测到虚拟 DualSense，不能将当前连接视为原生模式。");
         } catch (Exception ex) { connectionChecked=false;blockers.Add("手柄枚举失败：" + ex.Message); }
         if(usbip)try {
-            var ports=await Run.Text(Paths.Usbip,["port"]);
+            var ports=await Run.Text(Paths.Usbip,["port"],cancel:cancel);
             importedPort=ports.Contains("usbip://127.0.0.1:3240/1-1",StringComparison.OrdinalIgnoreCase);
             if(importedPort)blockers.Add("本机桥接虚拟 USB 端口仍存在，请先确认并恢复所属会话。");
         }catch(Exception ex){connectionChecked=false;blockers.Add("无法确认虚拟 USB 端口状态："+ex.Message);}
         if (!devices.Any(x => x.Transport == "蓝牙"))
             blockers.Add("未检测到可读取的蓝牙 DualSense。完成普通蓝牙配对、拔掉数据线并唤醒手柄后再检查。");
         string[] audio = [];
-        try { audio = Audio.Snapshot().Defaults.Where(x => x.Flow == 0).Select(x => x.Name).Distinct().ToArray(); }
+        try { audio = (await readAudio()).Defaults.Where(x => x.Flow == 0).Select(x => x.Name).Distinct().ToArray(); }
         catch (Exception ex) { blockers.Add("无法读取默认音频设备：" + ex.Message); }
         if(audio.Length==0)blockers.Add("没有可用的默认播放设备。请先连接所需音箱或耳机并确认正常播放，再启用桥接。");
         notes.Add("《影之刃：零》尚未实机验收。优先比较同一场景的 USB 原生与蓝牙桥接效果。");

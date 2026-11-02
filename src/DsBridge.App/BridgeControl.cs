@@ -8,8 +8,8 @@ internal sealed record SpeakerPreference(bool? SpeakerMuted);
 internal sealed record BackendLiveStatus(bool OK,bool Connected,string Address,int BatteryRaw,long BatteryAgeMs,bool SpeakerMuted);
 internal static class BridgeControl {
     static readonly JsonSerializerOptions Json=new(){PropertyNameCaseInsensitive=true};
-    public static async Task<BackendLiveStatus> Query(string pipeName,bool? muted=null) {
-        using var timeout=new CancellationTokenSource(1500);
+    public static async Task<BackendLiveStatus> Query(string pipeName,bool? muted=null,CancellationToken cancel=default) {
+        using var timeout=CancellationTokenSource.CreateLinkedTokenSource(cancel);timeout.CancelAfter(1500);
         using var pipe=new NamedPipeClientStream(".",pipeName,PipeDirection.InOut,PipeOptions.Asynchronous);
         await pipe.ConnectAsync(timeout.Token);
         var command=muted is bool value?JsonSerializer.Serialize(new {command="speaker",mode=value?"mute":"unmute"}):"{\"command\":\"bridge-status\"}";
@@ -26,6 +26,6 @@ internal static class BridgeControl {
     public static void Save(string directory,BridgeTelemetry value) {
         var file=Path.Combine(directory,"telemetry.json");
         File.WriteAllText(file+".new",JsonSerializer.Serialize(value));
-        File.Move(file+".new",file,true);
+        AtomicJson.Publish(file+".new",file);
     }
 }

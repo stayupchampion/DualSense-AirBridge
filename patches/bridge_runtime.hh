@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include <algorithm>
 #include <chrono>
 #include <deque>
 #include "vds_protocol.hh"
@@ -33,8 +34,9 @@ public:
   }
 };
 
-// Preserve light/mic-button preferences; release forces and stop bridge-owned audio.
-// The caller also closes the microphone stream using the existing protocol builder.
+// Release forces and stop bridge-owned audio without undoing the user's mic mute.
+// This is intermediate: the caller closes the microphone and hands lighting back
+// to firmware after all ordinary writers have stopped.
 inline vds::BtStateReport neutral_output(vds::DsOutputState& state, bool headset) {
   std::array<std::uint8_t,48> usb{};
   usb[0]=VDS_USB_OUTPUT_REPORT_ID;
@@ -42,5 +44,22 @@ inline vds::BtStateReport neutral_output(vds::DsOutputState& state, bool headset
   state.set_audio_out_stream_active(false,headset);
   state.apply_usb_output_report(usb);
   return state.build_bt_state_report();
+}
+
+// Terminal reports only: release the host lighting, then enable the firmware's
+// native Bluetooth light. Never replay the retained yellow/custom RGB or audio
+// controls here. The transport must bypass the speaker-preference filter for
+// these reports; that filter would otherwise add audio/mute writes.
+inline vds::BtStateReport lighting_handoff(vds::DsOutputState& state, bool native_light) {
+  auto report=state.build_bt_state_report(); // Retain the next sequence/header.
+  std::fill(report.begin()+3,report.end(),std::uint8_t{0});
+  if(native_light) {
+    report[41]=0x02; // Lightbar setup enable.
+    report[44]=0x01; // Firmware light on, not a custom RGB value.
+  } else {
+    report[4]=0x18; // Release host LEDs and clear bridge/game player indicators.
+  }
+  vds::fill_output_report_checksum(report);
+  return report;
 }
 }

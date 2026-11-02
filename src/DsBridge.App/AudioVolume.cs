@@ -5,6 +5,7 @@ internal sealed record PlaybackVolume(string Id,string Name,int[] DefaultRoles,f
 internal sealed record VolumeObservation(DateTimeOffset At,PlaybackVolume[] Outputs,string Error) {
     public string Display {
         get {
+            if(Error.Length>0)return "Windows 音量：读取暂不可用";
             var output=Outputs.FirstOrDefault(x=>x.DefaultRoles.Contains(0));
             if(output is null)return "Windows 音量：默认输出暂不可用";
             var value=output.Scalar is float v?$"{Math.Round(v*100)}%":"读数暂不可用";

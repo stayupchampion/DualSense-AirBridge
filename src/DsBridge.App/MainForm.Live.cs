@@ -8,6 +8,7 @@ internal sealed partial class MainForm {
     readonly Label volumeLabel=new(){Text="Windows 音量：正在读取",Dock=DockStyle.Fill,AutoEllipsis=true,TextAlign=ContentAlignment.MiddleLeft};
     readonly ToolTip liveTips=new();
     VolumeObservation? lastVolume;
+    AudioWorker liveAudio=new(readOnly:true);
     DateTime nextBattery=DateTime.MinValue,nextVolume=DateTime.MinValue;
     CancellationTokenSource? batteryCancel;
     Task? batteryRead;
@@ -82,7 +83,7 @@ internal sealed partial class MainForm {
             }
             if(now>=nextVolume) {
                 nextVolume=now.AddSeconds(1);
-                var value=await Task.Run(Audio.ReadVolumes);
+                var value=await liveAudio.ReadVolumes();
                 if(closing||IsDisposed)return;
                 lastVolume=value;volumeLabel.Text=value.Display;
             }

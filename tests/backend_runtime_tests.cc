@@ -6,8 +6,38 @@
 #include "controller_preferences.hh"
 using namespace std::chrono_literals;
 void test_diagnostics();
+void test_audio_controls();
+void test_handshake();
 void require(bool value, const char* why) {
   if(!value) throw std::runtime_error(why);
+}
+void test_lighting_handoff() {
+  vds::DsOutputState state;
+  std::array<std::uint8_t,48> game{};game.fill(0x55);
+  game[0]=2;game[1]=0xff;game[2]=0xf7;
+  require(state.apply_usb_output_report(game),"lighting test setup failed");
+  const auto retained=state.state();
+  const auto release=dsbridge::lighting_handoff(state,false);
+  const auto native=dsbridge::lighting_handoff(state,true);
+  require(state.state()==retained,"terminal light handoff altered active/game state");
+  require(release[0]==0x31&&release[2]==0x10&&native[0]==0x31&&native[2]==0x10,
+          "light handoff lost Bluetooth framing");
+  require(native[1]==static_cast<std::uint8_t>((release[1]+0x10)&0xf0),
+          "light handoff reused the output sequence");
+  require(release[4]==0x18&&release[46]==0,"host/player LEDs were not released");
+  require(native[41]==2&&native[44]==1&&native[4]==0,
+          "firmware native lighting was not requested independently of RGB");
+  for(std::size_t i=3;i<74;++i) {
+    if(i!=4)require(release[i]==0,"LED release leaked an audio, force or RGB field");
+    if(i!=41&&i!=44)require(native[i]==0,"native light handoff leaked retained game fields");
+  }
+  for(auto report:{release,native}) {
+    auto crc=report;vds::fill_output_report_checksum(crc);
+    require(crc==report,"light handoff CRC invalid");
+  }
+  const auto repeated=dsbridge::lighting_handoff(state,true);
+  require(std::equal(native.begin()+2,native.begin()+74,repeated.begin()+2),
+          "repeated light handoff changed its effect");
 }
 void test_speaker_preference() {
   require(dsbridge::speaker_muted.load(),"controller speaker must default to muted");
@@ -50,7 +80,10 @@ void test_speaker_preference() {
 int main() {
   try {
     test_speaker_preference();
+    test_lighting_handoff();
     test_diagnostics();
+    test_audio_controls();
+    test_handshake();
     dsbridge::ReplyEpoch epoch;
     require(!epoch.accepts(epoch.current()),"inactive session accepts a reply");
     const auto first_session=epoch.activate();

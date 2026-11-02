@@ -99,16 +99,33 @@ struct BridgeWorker''', '''  if (stop_monitor.joinable()) {
   // request_bridge_restart's cancellation once the restart flag was set.
   bluetooth->cancel(); // Cancels this HID handle/writer only; no radio reset.
   // Send final neutral reports only after the normal writer has joined.
-  try {
-    const auto neutral = dsbridge::neutral_output(state.output_state, state.headset_plugged);
-    bluetooth->write_shutdown_packet(hidp_output_packet(neutral));
-    const auto mic_close = state.output_state.build_bt_mic_report(false);
-    bluetooth->write_shutdown_packet(hidp_output_packet(mic_close));
+  const auto shutdown_write = [&](const auto& report, const char* label,
+                                  bool apply_speaker_preference = true) {
+    try {
+      bluetooth->write_shutdown_packet(hidp_output_packet(report), apply_speaker_preference);
+      return true;
+    } catch (const std::exception &error) {
+      logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
+                 std::string("shutdown ") + label + " not confirmed: " + error.what());
+      return false;
+    }
+  };
+  // Each operation is attempted even if an earlier write failed. None is sent
+  // after the physical device is revealed to other applications by the manager.
+  const bool neutral_ok = shutdown_write(
+      dsbridge::neutral_output(state.output_state, state.headset_plugged), "neutralization");
+  const bool mic_ok = shutdown_write(state.output_state.build_bt_mic_report(false), "mic close");
+  if (neutral_ok && mic_ok) {
     logger.log(vds::LogScope::Output, vds::LogLevel::Info,
                "shutdown neutral reports written; microphone close written");
-  } catch (const std::exception &error) {
-    logger.log(vds::LogScope::Output, vds::LogLevel::Warn,
-               std::string("shutdown neutralization not confirmed: ") + error.what());
+  }
+  const bool release_ok = shutdown_write(
+      dsbridge::lighting_handoff(state.output_state, false), "LED release", false);
+  const bool native_light_ok = shutdown_write(
+      dsbridge::lighting_handoff(state.output_state, true), "native light", false);
+  if (release_ok && native_light_ok) {
+    logger.log(vds::LogScope::Output, vds::LogLevel::Info,
+               "shutdown lighting released; native light requested");
   }
 }
 
@@ -127,12 +144,13 @@ struct BridgeWorker''')
 
 def transport_header(s):
     return one(s,'  virtual void cancel() = 0;',
-        '  virtual void write_shutdown_packet(std::span<const std::uint8_t> packet) = 0;\n  virtual void cancel() = 0;')
+        '  virtual void write_shutdown_packet(std::span<const std::uint8_t> packet, bool apply_speaker_preference = true) = 0;\n  virtual void cancel() = 0;')
 
 def transport(s):
     return one(s,'''  void cancel() override {''', '''  // Used only after every producer and the normal writer have joined.
   // It has its own completion event because the normal stop event is latched.
-  void write_shutdown_packet(std::span<const std::uint8_t> packet) override {
+  void write_shutdown_packet(std::span<const std::uint8_t> packet,
+                             bool apply_speaker_preference = true) override {
     if (packet.empty() || packet[0] != kBtHidpOutputPrefix)
       throw std::runtime_error("invalid shutdown HID packet");
     {

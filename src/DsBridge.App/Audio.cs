@@ -148,19 +148,20 @@ internal static partial class Audio {
         }finally {Marshal.ReleaseComObject(e);}
     }
 
-    public static int GuardDefaults(AudioState baseline,Action<AudioObservation>? observe=null) {
-        var current=Observe(false);int restored=0;
-        foreach(var original in baseline.Defaults) {
-            var now=current.Defaults.FirstOrDefault(x=>x.Flow==original.Flow&&x.Role==original.Role);
-            // A disconnected baseline is evidence to report, never a target to force back on.
-            if(!RecoveryAssessment.ShouldRestoreDefault(baseline,original,now,current.Endpoints))continue;
-            if(!IsVirtualDualSense(now!.Id))throw new InvalidOperationException("新增手柄音频端点的来源无法确认，已停止桥接，未擅自更改默认输出。");
-            if(!IsEndpointActive(original.Id))continue;
-            var policy=(Policy)Activator.CreateInstance(Type.GetTypeFromCLSID(new("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9"))!)!;
-            try {Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(original.Id,original.Role));restored++;}
-            finally {Marshal.ReleaseComObject(policy);}
-        }
-        observe?.Invoke(current);
-        return restored;
+    static string? CurrentDefault(int flow,int role) {
+        var e=Open();
+        try {
+            var hr=e.GetDefaultAudioEndpoint(flow,role,out var device);
+            if(hr==unchecked((int)0x80070490))return null;
+            Marshal.ThrowExceptionForHR(hr);
+            try {Marshal.ThrowExceptionForHR(device.GetId(out var id));return id;}
+            finally {Marshal.ReleaseComObject(device);}
+        }finally {Marshal.ReleaseComObject(e);}
     }
+    public static AudioGuardResult GuardDefaults(AudioState baseline) =>
+        AudioDefaults.Guard(baseline,()=>Observe(false),IsVirtualDualSense,IsEndpointActive,CurrentDefault,original=>{
+            var policy=(Policy)Activator.CreateInstance(Type.GetTypeFromCLSID(new("870AF99C-171D-4F9E-AF0D-E63DF40C2BC9"))!)!;
+            try {Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(original.Id,original.Role));}
+            finally {Marshal.ReleaseComObject(policy);}
+        });
 }

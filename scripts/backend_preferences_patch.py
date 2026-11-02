@@ -74,9 +74,10 @@ def transport(s):
     s=one(s,'return QueuedOutputWrite{std::move(buffer)};','return QueuedOutputWrite{std::move(buffer),report.size()};')
     # Filter immediately before WriteFile, after dequeue, so a queued game
     # report cannot undo a newly selected mute preference.
-    # Both final shutdown and ordinary writes are targeted below using the
-    # complete enclosing lines to keep a mismatch fail-closed.
-    s=one(s,'''    if (!WriteFile(output_handle_.get(), write.buffer.data(),''','''    dsbridge::mute_speaker_report(std::span(write.buffer).first(write.report_size),dsbridge::speaker_muted.load());
+    # Final neutral output keeps the filter; terminal LED-only handoff explicitly
+    # bypasses it so restoring the light cannot clear/rewrite audio mute fields.
+    s=one(s,'''    if (!WriteFile(output_handle_.get(), write.buffer.data(),''','''    if (apply_speaker_preference)
+      dsbridge::mute_speaker_report(std::span(write.buffer).first(write.report_size),dsbridge::speaker_muted.load());
     if (!WriteFile(output_handle_.get(), write.buffer.data(),''')
     s=one(s,'''      try {
         std::size_t offset = 0;

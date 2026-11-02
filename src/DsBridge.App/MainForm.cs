@@ -80,6 +80,7 @@ internal sealed partial class MainForm : Form {
         if(busy||closing||Running)return;
         busy=true;UpdateButtons();
         try {
+            if(!liveAudio.IsUsable){await liveAudio.DisposeAsync();liveAudio=new(readOnly:true);}
             probe=await Task.Run(Probe.Read);
             if(closing||IsDisposed)return;
             controllers.Items.Clear();
@@ -131,16 +132,21 @@ internal sealed partial class MainForm : Form {
         var file=Path.Combine(session,"status.json");
         if(File.Exists(file)) try {
             var status=AtomicJson.Read<SessionStatus>(file);
-            state.Text=status.State switch {
+            var displayState=RecoveryAssessment.DisplayState(status.State,Running);
+            state.Text=displayState switch {
                 "active"=>"蓝牙桥接已连接","checking" or "starting"=>"正在启用蓝牙桥接",
                 "restoring"=>"正在停止并检查恢复","restored"=>"桥接已停止 · 配置已清理",
                 "restored-with-warning"=>"桥接已停止 · 设备状态待确认",
                 "recovery-required"=>"恢复尚未完成","stopped" or "blocked"=>"桥接未运行",_=>status.State
             };
-            description.Text=status.Message.Split('\n')[0];
+            if(displayState=="worker-exited") {
+                state.Text="会话进程已退出 · 恢复待检查";
+                description.Text="未收到最终恢复确认，请检查连接并处理遗留状态。";
+                detail.Text=description.Text+"\n\n会话记录："+session;
+            }else description.Text=status.Message.Split('\n')[0];
             if(status.State is "restored" or "restored-with-warning" or "stopped" or "blocked" or "recovery-required") detail.Text=status.Message+"\n\n会话记录："+session;
         }catch(IOException){}catch(System.Text.Json.JsonException){}
-        if(worker is not null&&worker.HasExited) {
+        if(worker is not null&&worker.HasExited&&stoppingTask is null) {
             worker.Dispose();worker=null;
             if(!File.Exists(file)) {state.Text="桥接未运行";description.Text="会话进程已退出，请检查恢复记录。";}
         }
@@ -236,6 +242,7 @@ internal sealed partial class MainForm : Form {
                 MessageBox.Show(this,"存在尚未确认恢复的会话。关闭窗口不会清除残留规则；下次需使用“恢复遗留状态”。仍要退出吗？","恢复尚未完成",MessageBoxButtons.YesNo,MessageBoxIcon.Warning,MessageBoxDefaultButton.Button2)!=DialogResult.Yes)return;
             timer.Stop();
             await StopBatteryRead();
+            await liveAudio.DisposeAsync();
             await Task.Yield(); // Let the original FormClosing event unwind before closing again.
             allowClose=true;Close();
         }catch(Exception ex) {

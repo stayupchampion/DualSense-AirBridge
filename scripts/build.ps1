@@ -19,6 +19,8 @@ dotnet build src\DsBridge.App\DsBridge.App.csproj -c Release --nologo
 if($LASTEXITCODE -ne 0){throw 'App build failed'}
 dotnet run --project tests\DsBridge.Tests\DsBridge.Tests.csproj -c Release
 if($LASTEXITCODE -ne 0){throw 'Safety tests failed'}
+& (Join-Path $PSScriptRoot 'test-audio-worker.ps1')
+& (Join-Path $PSScriptRoot 'test-process-lifecycle.ps1')
 dotnet publish src\DsBridge.App\DsBridge.App.csproj -c Release -r win-x64 --self-contained true -p:DebugType=None -p:DebugSymbols=false -o $publishRoot --nologo
 if($LASTEXITCODE -ne 0){throw 'Publish failed'}
 $backendRoot=Join-Path $publishRoot 'backend'

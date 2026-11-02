@@ -2,6 +2,9 @@ using DsBridge.Core;
 using System.Text.Json;
 var count=0;
 void Check(bool value,string label) { if(!value)throw new Exception("FAIL: "+label); count++;Console.WriteLine("PASS "+label); }
+StabilityTests.Run(Check);
+await RecoveryFaultTests.Run(Check);
+await AtomicReadTests.Run(Check);
 async Task Reject(Func<Task> action,string label) {try{await action();}catch(InvalidOperationException){Check(true,label);return;}throw new Exception("DID NOT REJECT "+label);}
 HideState Empty()=>new(false,false,[],[]);
 Journal Make(HideState? state=null)=>new(){Original=state??Empty(),BackendPath=@"E:\bridge\backend\vdsd.exe",InstanceId=@"HID\TEST_DS5",Address="01:23:45:67:89:ab"};
@@ -140,13 +143,14 @@ Check(!File.Exists(path+".new"),"atomic journal leaves no temp after success");
     Check(RecoveryAssessment.Warnings(baseline,healthy).Length==0,"observed input and active matching defaults confirm this sample");
     var changed=healthy with{Audio=new(DateTimeOffset.Now,[new(0,0,"other","Other Headset")],
         [new("bose","Bose Mini II SE",1),new("other","Other Headset",1)],"")};
-    Check(RecoveryAssessment.Warnings(baseline,changed).Any(x=>x.Contains("与启动时不同")),
+    Check(RecoveryAssessment.Warnings(baseline,changed).Any(x=>x.Contains("与最近记录的选择不同")),
         "changed default is evidence rather than silently claimed restored");
     Check(RecoveryAssessment.Warnings(baseline,healthy with{Audio=new(DateTimeOffset.Now,[],[],"timeout")})
         .Any(x=>x.Contains("未确认")),"failed observation cannot claim healthy audio");
 }
 
 DualSenseInputTests.Run(Check);
+AudioDefaultsTests.Run(Check);
 {
     var native=new ConnectionEvidence(true,false,false,false,false,true,false,true);
     Check(ConnectionAssessment.IdleStatus(native)=="原生蓝牙可用 · 桥接未运行","native status requires observed absence of bridging");

@@ -38,8 +38,10 @@ try {
 } finally { $archive.Dispose() }
 $commit = (& git -C $root rev-parse HEAD 2>$null)
 if ($LASTEXITCODE -ne 0) { $commit = 'uncommitted-local-check' }
+$sourceChanges = (& git -C $root status --porcelain --untracked-files=normal 2>$null)
+$sourceDirty = if ($LASTEXITCODE -eq 0) { ![string]::IsNullOrWhiteSpace(($sourceChanges -join "`n")) } else { $null }
 $manifest = [ordered]@{
-  name = 'DualSense AirBridge'; version = $version; platform = 'win-x64'; sourceCommit = $commit
+  name = 'DualSense AirBridge'; version = $version; platform = 'win-x64'; sourceCommit = $commit; sourceDirty = $sourceDirty
   backendUpstreamCommit = 'ec531599dfdd02e14ce68efd8c0d2dcb439894a5'
   buildUtc = (Get-Date).ToUniversalTime().ToString('o')
   appSha256 = (Get-FileHash -LiteralPath (Join-Path $build 'DualSenseBridge.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
