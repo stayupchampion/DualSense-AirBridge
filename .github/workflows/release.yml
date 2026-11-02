@@ -39,6 +39,13 @@ jobs:
         run: |
           git diff --exit-code -- patches licenses
           if ($LASTEXITCODE -ne 0) { throw 'Generated source or license drift' }
+          $changes = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify source workspace' }
+          if ($changes.Count) {
+            $changes | Write-Output
+            git diff --stat
+            throw 'Build left unexpected source workspace changes'
+          }
       - name: Package and inspect release
         run: ./scripts/package-release.ps1 -BuildDirectory '.local/release/app' -OutputDirectory '.local/release/assets'
       - name: Publish release with versioned notes
