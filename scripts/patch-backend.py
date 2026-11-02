@@ -156,7 +156,7 @@ def main():
         diffs.extend(difflib.unified_diff([],updated.splitlines(True),fromfile='/dev/null',tofile='b/'+relative))
         records.append({'path':relative,'patchedSha256':hashlib.sha256(updated.encode()).hexdigest()})
     (patches / 'vds-managed-session.patch').write_text(''.join(diffs), encoding='utf-8', newline='\n')
-    (patches / 'vds-managed-session.json').write_text(json.dumps({'upstreamCommit':COMMIT,'bridgeProtocol':1,'files':records},indent=2)+'\n', encoding='utf-8')
+    (patches / 'vds-managed-session.json').write_text(json.dumps({'upstreamCommit':COMMIT,'bridgeProtocol':1,'files':records},indent=2)+'\n', encoding='utf-8', newline='\n')
     (root / 'licenses').mkdir(exist_ok=True)
     shutil.copyfile(source / 'LICENSE', root / 'licenses/vDS-MIT.txt')
     print(dest)

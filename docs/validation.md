@@ -8,6 +8,12 @@
 
 恢复范围限于工具拥有的变更，保留用户和其他软件的后续调整。自然待机重连、原生 USB 回退仍待本版复测；不承诺任意原有自定义灯效或不可读取的固件内部状态精确复原，也不以本机 Bose 结果推断所有蓝牙音频故障均已解决。详见 [正式版本说明](releases/v0.1.5.md) 和 [手柄状态恢复](controller-state-recovery.md)。
 
+### 发布包构建清单核对
+
+v0.1.5 标签包的 `sourceDirty: true` 来自 Windows 构建将三个许可证文件和 `patches/vds-managed-session.json` 的 LF／CRLF 换行重新写入。[云端复核](https://github.com/stayupchampion/DualSense-AirBridge/actions/runs/41455736728) 列出的改动仅为这四个文件；Git 内容差异为空。下载包中的四个文件逐一按换行归一化后与标签内容相同，程序版本为 `0.1.5+0a1847dec3ed58fa434bcb286a20f9ef0459ff62`，ZIP 与二进制摘要均匹配清单。
+
+后续构建已明确许可证采用 LF，补丁清单生成也固定为 LF，并在打包前检查整个源码工作区。此调整只涉及构建与验证；v0.1.5 的标签、已发布二进制和附件保持不变。
+
 ## 0.1.4 普通诊断与锁占用优化（2026-10-30）
 
 121 项 C# 检查、C++ 运行时及诊断并发/阻塞/排空检查、3 项补丁日志兼容性检查、后端空会话协议检查通过。独立审查确认两处问题修正后无剩余阻塞项。新版单独完成触觉、R2、取消归零、12 次脉冲及退出后约 90 秒的 19 次恢复观察，警告为 0；用户确认手柄反馈和 Bose 正常。默认仍为 3 块预缓冲，不新增驱动或开机项，也不宣称新的物理延迟降幅。详见 [诊断优化与验收](diagnostic-jitter-optimization.md) 和 `.local/tests/diagnostic-optimization-acceptance.json`。
