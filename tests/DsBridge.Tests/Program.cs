@@ -147,8 +147,65 @@ Check(!File.Exists(path+".new"),"atomic journal leaves no temp after success");
 }
 
 DualSenseInputTests.Run(Check);
+{
+    var native=new ConnectionEvidence(true,false,false,false,false,true,false,true);
+    Check(ConnectionAssessment.IdleStatus(native)=="原生蓝牙可用 · 桥接未运行","native status requires observed absence of bridging");
+    Check(ConnectionAssessment.IdleStatus(native with{BackendRunning=true}).Contains("检测到桥接"),"Bluetooth physical connection does not hide a running backend");
+    Check(ConnectionAssessment.IdleStatus(native with{VirtualController=true}).Contains("检测到桥接"),"virtual controller prevents a false native label");
+    Check(ConnectionAssessment.IdleStatus(native with{ImportedPort=true}).Contains("检测到桥接"),"leftover virtual port prevents a false native label");
+    Check(ConnectionAssessment.IdleStatus(native with{Checked=false})=="连接状态待确认","failed device inspection cannot report native mode");
+    Check(ConnectionAssessment.IdleStatus(native with{PendingRecovery=true})=="恢复尚未完成","pending cleanup remains visible");
+    Check(ConnectionAssessment.IdleStatus(native with{PlaybackAvailable=false}).Contains("默认播放设备不可用"),"missing Bluetooth audio is visible even after configuration cleanup");
+    Check(ConnectionAssessment.IdleStatus(native with{BluetoothPresent=false}).StartsWith("未连接手柄"),"disconnected controller is not reported as native Bluetooth");
+    Check(ConnectionAssessment.IdleStatus(native with{BluetoothPresent=false,UsbPresent=true}).StartsWith("原生 USB"),"physical USB keeps its independent connection status");
+}
 LatencyPulseSignalTests.Run(Check);
 
+{
+    var start=DateTimeOffset.UtcNow;
+    var speaker=new AudioDefault(0,0,"bose","Bose");
+    var baseline=new AudioState([speaker],["bose"]);
+    var timeline=new AudioTimeline(baseline);
+    var playing=new AudioObservation(start,[speaker],[new("bose","Bose",1)],"");
+    Check(timeline.Record("active",playing),"audio timeline captures its initial state");
+    Check(!timeline.Record("active",playing with{CapturedAt=start.AddSeconds(29)}),"unchanged audio is throttled without extra device polling");
+    Check(timeline.Record("active",playing with{CapturedAt=start.AddSeconds(30)}),"long idle sessions retain a bounded heartbeat");
+    Check(timeline.Record("active",playing with{CapturedAt=start.AddSeconds(31),Defaults=[new(0,0,"virtual","DualSense")]}),"temporary default takeover is retained before correction");
+    Check(timeline.Record("active",playing with{CapturedAt=start.AddSeconds(32),Endpoints=[]}) && !timeline.Entries[^1].StartupEndpoints[0].Active,"missing speaker availability is distinct from default selection");
+    Check(timeline.Record("after-stop",playing with{CapturedAt=start.AddSeconds(33)}) && timeline.Entries[^1].StartupEndpoints[0].Active,"restored endpoint state remains observable after cleanup");
+    for(int n=1;n<=300;n++)timeline.Record("active",playing with{CapturedAt=start.AddSeconds(34+30*n)});
+    Check(timeline.Entries.Count==AudioTimeline.Capacity && timeline.Entries[0].At>start,"long unattended sessions have bounded diagnostic history");
+}
+
+{
+    Check(ControllerBattery.Decode(-1).Percent is null&&ControllerBattery.Decode(256).Percent is null,"unavailable battery is not zero percent");
+    Check(ControllerBattery.Decode(0)==new ControllerBattery(5,"使用电池"),"battery capacity uses coarse band midpoint");
+    Check(ControllerBattery.Decode(9).Percent==95&&ControllerBattery.Decode(15).Percent==100,"battery percentage is capped");
+    Check(ControllerBattery.Decode(0x14)==new ControllerBattery(45,"充电中"),"charging state remains visible");
+    Check(ControllerBattery.Decode(0x20)==new ControllerBattery(100,"已充满"),"full-charge state overrides raw level");
+    Check(ControllerBattery.Decode(0xf5).Percent is null,"battery error does not fabricate capacity");
+    var usb=new byte[64];usb[0]=1;usb[53]=0x17;
+    Check(ControllerBattery.FromReport(usb,false).Percent==75,"USB battery offset includes report ID");
+    Check(ControllerBattery.FromReport(usb,true).Percent is null,"USB format not parsed as Bluetooth");
+    var bt=new byte[78];bt[0]=0x31;bt[1]=1;bt[54]=3;
+    uint crc=0xffffffff;
+    foreach(var b in new byte[]{0xa1}.Concat(bt.Take(74))) {
+        crc^=b;for(int bit=0;bit<8;bit++)crc=(crc&1)!=0?(crc>>1)^0xedb88320:crc>>1;
+    }
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(bt.AsSpan(74),~crc);
+    Check(ControllerBattery.FromReport(bt,true).Percent==35,"Bluetooth battery validates CRC and payload offset");
+    bt[10]^=1;Check(ControllerBattery.FromReport(bt,true).Percent is null,"corrupt Bluetooth reports rejected");
+    Check(ControllerBattery.FromReport([1,0,0,0,0,0,0,0,0,0],true).Percent is null,"simple native Bluetooth has no battery information");
+    Check(ControllerBattery.FromReport(usb.AsSpan(0,53),false).Percent is null,"truncated input safely rejected");
+    var now=DateTimeOffset.UtcNow;
+    var data=new BridgeTelemetry(now,"aa",true,6,0,true,"");
+    Check(data.Battery("aa",now).Percent==65,"bridge telemetry supplies battery");
+    Check(data.Battery("bb",now).Percent is null,"battery cannot leak across controller selection");
+    Check((data with{Connected=false}).Battery("aa",now).Percent is null,"disconnected battery not shown as current");
+    Check(data.Battery("aa",now.AddSeconds(13)).Percent is null,"stale telemetry expires");
+    Check((data with{BatteryAgeMs=14000}).Battery("aa",now.AddSeconds(2)).Percent is null,"report age and telemetry age combined");
+    Check((data with{BatteryAgeMs=-1}).Battery("aa",now).Percent is null,"invalid report timestamp rejected");
+}
 Console.WriteLine($"ALL {count} CHECKS PASSED");
 
 sealed class FakeHide(HideState initial):IHideAccess {

@@ -26,6 +26,20 @@ function Finish-Backend {
   return $Result
 }
 $Results = [ordered]@{}
+function Invoke-Control {
+  param([string]$Command)
+  $Client=[IO.Pipes.NamedPipeClientStream]::new('.', $PipeName, [IO.Pipes.PipeDirection]::InOut)
+  try {
+    $Client.Connect(5000)
+    $Bytes=[Text.Encoding]::UTF8.GetBytes($Command+"`n")
+    $Client.Write($Bytes,0,$Bytes.Length)
+    $Client.Flush()
+    $Buffer=New-Object byte[] 8192
+    $Read=$Client.ReadAsync($Buffer,0,$Buffer.Length)
+    if(!$Read.Wait(5000)){throw 'Control timed out'}
+    return ([Text.Encoding]::UTF8.GetString($Buffer,0,$Read.Result)|ConvertFrom-Json)
+  }finally{$Client.Dispose()}
+}
 $Results.identity = Finish-Backend (Start-Backend @('--bridge-info'))
 if ($Results.identity.exitCode -ne 0 -or ($Results.identity.stdout | ConvertFrom-Json).bridgeProtocol -ne 1) { throw 'Identity check failed' }
 $Results.missingArguments = Finish-Backend (Start-Backend @())
@@ -57,6 +71,19 @@ try {
     $Reply = [Text.Encoding]::UTF8.GetString($Buffer,0,$ReadTask.Result)
     $Results.privatePipe = $Reply | ConvertFrom-Json
     if (!$Results.privatePipe.OK) { throw ('Private pipe command failed: read=' + $ReadTask.Result + ' reply=' + $Reply) }
+    $Pipe.Dispose()
+    $Results.defaultPreferences=Invoke-Control '{"command":"bridge-status"}'
+    if(!$Results.defaultPreferences.OK -or !$Results.defaultPreferences.speakerMuted -or $Results.defaultPreferences.connected -or $Results.defaultPreferences.batteryRaw -ne -1){throw 'Invalid initial telemetry'}
+    $Results.unmute=Invoke-Control '{"command":"speaker","mode":"unmute"}'
+    if(!$Results.unmute.OK -or $Results.unmute.speakerMuted){throw 'Unmute not acknowledged'}
+    $Results.invalidMode=Invoke-Control '{"command":"speaker","mode":"invalid"}'
+    if($Results.invalidMode.OK){throw 'Invalid preference accepted'}
+    $Results.extraField=Invoke-Control '{"command":"speaker","mode":"mute","unexpected":"x"}'
+    if($Results.extraField.OK){throw 'Unexpected preference field accepted'}
+    $Results.afterRejected=Invoke-Control '{"command":"bridge-status"}'
+    if($Results.afterRejected.speakerMuted){throw 'Rejected request altered preference'}
+    $Results.mute=Invoke-Control '{"command":"speaker","mode":"mute"}'
+    if(!$Results.mute.OK -or !$Results.mute.speakerMuted){throw 'Mute not acknowledged'}
   } finally {
     $Pipe.Dispose()
     [void]$StopEvent.Set()

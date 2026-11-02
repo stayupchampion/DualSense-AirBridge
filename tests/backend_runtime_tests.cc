@@ -3,13 +3,53 @@
 #include <stdexcept>
 #include "bridge_runtime.hh"
 #include "usbip_hid_queue.hh"
+#include "controller_preferences.hh"
 using namespace std::chrono_literals;
 void test_diagnostics();
 void require(bool value, const char* why) {
   if(!value) throw std::runtime_error(why);
 }
+void test_speaker_preference() {
+  require(dsbridge::speaker_muted.load(),"controller speaker must default to muted");
+  vds::DsOutputState game;
+  auto state=game.build_bt_state_report();
+  auto init=game.build_bt_init_report();
+  vds::HapticsPacketBuilder builder;
+  std::array<std::int8_t,vds::kHapticsSampleSize> haptics{};haptics.fill(42);
+  std::array<std::uint8_t,vds::kSpeakerOpusSize> speaker{};speaker.fill(21);
+  vds::DsState raw{};
+  auto audio=builder.build_packet(haptics,speaker,raw,true,false);
+  auto check=[](auto original,std::size_t offset) {
+    // Preserve non-speaker bits, a microphone mute bit, and nonzero values in
+    // every unrelated field. The full before/after comparison covers all PCM,
+    // trigger, LED, headphone and microphone bytes.
+    original[offset]=0x81;original[offset+1]=0x80;
+    original[offset+4]=90;original[offset+5]=100;original[offset+6]=60;
+    original[offset+9]=0x11;
+    vds::fill_output_report_checksum(original);
+    auto muted=original;
+    require(dsbridge::mute_speaker_report(muted,true),"recognized report was not muted");
+    require(muted[offset]==0xa1&&muted[offset+1]==0x82&&muted[offset+5]==0&&muted[offset+9]==0x31,"speaker override bits incorrect");
+    for(std::size_t i=0;i<muted.size()-4;++i)
+      if(i!=offset&&i!=offset+1&&i!=offset+5&&i!=offset+9)
+        require(muted[i]==original[i],"speaker mute changed unrelated output data");
+    auto checksum=muted;vds::fill_output_report_checksum(checksum);
+    require(checksum==muted,"speaker override CRC invalid");
+    require(!dsbridge::mute_speaker_report(muted,true),"already-muted report was rewritten");
+    auto unmuted=original;
+    require(!dsbridge::mute_speaker_report(unmuted,false)&&unmuted==original,"unmute changed game output");
+  };
+  check(state,3);check(init,4);check(audio,13);
+  auto mic=game.build_bt_mic_report(false);auto before=mic;
+  require(!dsbridge::mute_speaker_report(mic,true)&&mic==before,"speaker filter changed microphone command");
+  std::array<std::uint8_t,77> short_report{};short_report[0]=0x31;
+  require(!dsbridge::mute_speaker_report(short_report,true),"truncated report was accepted");
+  auto retained=game.build_bt_state_report();
+  require(retained[8]==state[8]&&retained[12]==state[12],"speaker filter altered retained game state");
+}
 int main() {
   try {
+    test_speaker_preference();
     test_diagnostics();
     dsbridge::ReplyEpoch epoch;
     require(!epoch.accepts(epoch.current()),"inactive session accepts a reply");

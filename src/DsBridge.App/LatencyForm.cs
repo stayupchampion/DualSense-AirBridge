@@ -3,15 +3,15 @@ using System.Drawing.Drawing2D;
 using DsBridge.Core;
 namespace DsBridge.App;
 
-internal sealed class LatencyForm:Form {
+internal sealed partial class LatencyForm:Form {
     sealed record TargetChoice(Controller Target) {public override string ToString()=>FeedbackTests.Label(Target);}
     sealed record KindChoice(LatencyKind Kind){public override string ToString()=>LatencyCapture.Name(Kind);}
     readonly ComboBox targets=new(){DropDownStyle=ComboBoxStyle.DropDownList,Width=320};
     readonly ComboBox kinds=new(){DropDownStyle=ComboBoxStyle.DropDownList,Width=180};
     readonly ComboBox fps=new(){DropDownStyle=ComboBoxStyle.DropDownList,Width=80};
-    readonly Button refresh=new(){Text="刷新目标",AutoSize=true};
-    readonly Button start=new(){Text="开始本项（3 秒准备）",AutoSize=true};
-    readonly Button stop=new(){Text="停止并保存",AutoSize=true};
+    readonly UiButton refresh=new(){Text="刷新目标"};
+    readonly UiButton start=new(){Text="开始记录 · 3 秒准备",Primary=true};
+    readonly UiButton stop=new(){Text="停止并保存",Destructive=true};
     readonly Label instructions=new(){AutoSize=true,Dock=DockStyle.Fill};
     readonly Label state=new(){AutoSize=true,Text="先连接 USB，选择测试项；尚未采集或发送反馈。"};
     readonly RichTextBox notes=new(){ReadOnly=true,Dock=DockStyle.Fill,BackColor=Color.White,BorderStyle=BorderStyle.None,DetectUrls=false};
@@ -27,26 +27,7 @@ internal sealed class LatencyForm:Form {
     long flashUntil;
     Stopwatch? clock;
     public LatencyForm() {
-        Text="DualSense Bridge · USB / 蓝牙桥接延迟对比";
-        Size=new(1140,900);MinimumSize=new(920,760);StartPosition=FormStartPosition.CenterScreen;
-        Font=new("Microsoft YaHei UI",10);BackColor=Color.FromArgb(242,245,249);
-        var layout=new TableLayoutPanel{Dock=DockStyle.Fill,ColumnCount=1,RowCount=7,Padding=new(20)};
-        layout.ColumnStyles.Add(new(SizeType.Percent,100));
-        layout.RowStyles.Add(new(SizeType.AutoSize));layout.RowStyles.Add(new(SizeType.AutoSize));
-        layout.RowStyles.Add(new(SizeType.AutoSize));layout.RowStyles.Add(new(SizeType.AutoSize));
-        layout.RowStyles.Add(new(SizeType.Percent,68));layout.RowStyles.Add(new(SizeType.AutoSize));
-        layout.RowStyles.Add(new(SizeType.Percent,32));
-        layout.Controls.Add(new Label{Text="USB / 蓝牙桥接 · 同流程拍摄对比",AutoSize=true,Font=new(Font.FontFamily,17,FontStyle.Bold),Padding=new(0,0,0,8)},0,0);
-        layout.Controls.Add(new Label{Text="输入：拍摄手部动作 → 本窗口响应。输出：拍摄提交标记 → 可见振动 / 扳机位移。\n软件报告间隔不是硬件延迟；屏幕标记有显示延迟；结果必须结合视频逐帧核对。",AutoSize=true,Dock=DockStyle.Fill,Padding=new(0,0,0,10)},0,1);
-        var selection=new FlowLayoutPanel{AutoSize=true,Dock=DockStyle.Fill,WrapContents=true};
-        selection.Controls.Add(targets);selection.Controls.Add(refresh);selection.Controls.Add(kinds);
-        selection.Controls.Add(new Label{Text="拍摄 fps",AutoSize=true,Padding=new(4,6,0,0)});selection.Controls.Add(fps);
-        layout.Controls.Add(selection,0,2);
-        var actions=new FlowLayoutPanel{AutoSize=true,Dock=DockStyle.Fill,WrapContents=true,Padding=new(0,8,0,8)};
-        actions.Controls.Add(start);actions.Controls.Add(stop);actions.Controls.Add(state);layout.Controls.Add(actions,0,3);
-        layout.Controls.Add(canvas,0,4);
-        instructions.Padding=new(0,10,0,10);layout.Controls.Add(instructions,0,5);
-        layout.Controls.Add(notes,0,6);Controls.Add(layout);
+        BuildLayout();
         foreach(var k in Enum.GetValues<LatencyKind>())kinds.Items.Add(new KindChoice(k));
         kinds.SelectedIndex=0;fps.Items.AddRange([120,240]);fps.SelectedItem=240;
         kinds.SelectedIndexChanged+=(_,_)=>UpdateControls();

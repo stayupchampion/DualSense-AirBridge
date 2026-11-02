@@ -15,7 +15,8 @@ $build = ProjectPath $BuildDirectory
 $output = ProjectPath $OutputDirectory
 if ($output.StartsWith($build.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or $output -eq $build) { throw 'Assets must be outside the app directory' }
 $version = ([xml](Get-Content -LiteralPath (Join-Path $root 'src\DsBridge.App\DsBridge.App.csproj') -Raw)).Project.PropertyGroup.Version
-if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Invalid version' }
+# Main-branch CI also packages development builds; only tag builds publish a release.
+if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$') { throw 'Invalid version' }
 foreach ($required in @('DualSenseBridge.exe','backend\vdsd.exe','README.md','README.en.md','LICENSE','licenses\vDS-MIT.txt','licenses\Opus-BSD.txt','licenses\dotnet-THIRD-PARTY-NOTICES.txt','assets\branding\dualsense-airbridge.ico')) {
   if (!(Test-Path -LiteralPath (Join-Path $build $required) -PathType Leaf)) { throw "Missing release file: $required" }
 }

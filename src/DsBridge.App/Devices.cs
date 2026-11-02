@@ -90,6 +90,33 @@ internal static class Devices {
         }
     }
 
+    internal static async Task<ControllerBattery> ReadBattery(Controller selected,CancellationToken cancel) {
+        try {
+            cancel.ThrowIfCancellationRequested();
+            using var handle=CreateFile(selected.DevicePath,0x80000000,3,IntPtr.Zero,3,0x40000000,IntPtr.Zero);
+            if(handle.IsInvalid)return new(null,"设备不可读或已断开");
+            var attrs=new Attributes{Size=Marshal.SizeOf<Attributes>()};
+            if(!HidD_GetAttributes(handle,ref attrs)||attrs.Vendor!=0x054c||attrs.Product!=0x0ce6)
+                return new(null,"设备已变化");
+            if(!HidD_GetPreparsedData(handle,out var data))return new(null,"暂不可用");
+            int length;
+            try {
+                var caps=new byte[64];
+                if(HidP_GetCaps(data,caps)!=0x110000)return new(null,"暂不可用");
+                length=BitConverter.ToUInt16(caps,4);
+            }finally {HidD_FreePreparsedData(data);}
+            if(length<1||length>4096)return new(null,"报告长度无效");
+            using var stream=new FileStream(handle,FileAccess.Read,1,true);
+            using var timeout=CancellationTokenSource.CreateLinkedTokenSource(cancel);
+            timeout.CancelAfter(350);
+            var report=new byte[length];
+            var count=await stream.ReadAsync(report,timeout.Token).ConfigureAwait(false);
+            return ControllerBattery.FromReport(report.AsSpan(0,count),selected.Transport=="蓝牙");
+        }catch(OperationCanceledException){return new(null,"等待输入报告");}
+        catch(IOException){return new(null,"设备不可读或已断开");}
+        catch(UnauthorizedAccessException){return new(null,"设备正在由其他程序管理");}
+    }
+
     public static Controller[] Enumerate() {
         var result = new List<Controller>();
         HidD_GetHidGuid(out var guid);

@@ -4,6 +4,19 @@ namespace DsBridge.App;
 internal static class Program {
     [STAThread] static int Main(string[] args) {
         try {
+            if(args.Length==3&&args[0]=="--volume-watch"&&int.TryParse(args[2],out var seconds)&&seconds is >=1 and <=120) {
+                var path=Path.GetFullPath(args[1]);
+                if(!path.StartsWith(Path.GetFullPath(Paths.State)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("诊断输出必须放在本工具 .local 目录内。");
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                using var log=new StreamWriter(path,false,new System.Text.UTF8Encoding(false)){AutoFlush=true};
+                var until=DateTime.UtcNow.AddSeconds(seconds);
+                while(DateTime.UtcNow<until) {
+                    log.WriteLine(System.Text.Json.JsonSerializer.Serialize(Audio.ReadVolumes()));
+                    Thread.Sleep(250);
+                }
+                return 0;
+            }
             if(args.Length==1&&args[0]=="--test-lease-probe") {
                 try{using var lease=DeviceTestLease.Acquire();return 0;}
                 catch(InvalidOperationException){return 2;}

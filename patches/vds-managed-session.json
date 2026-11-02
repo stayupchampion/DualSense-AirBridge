@@ -5,7 +5,7 @@
     {
       "path": "src/platform/win32/vdsd.cc",
       "upstreamSha256": "448f864190421c1a5ecfdc293240541210313c254db2913c3c841d9b5980f468",
-      "patchedSha256": "be996ab47e4aa7a0d6d8d7826d6c5478af73f1aeccd102496d32685ad0ebf640"
+      "patchedSha256": "a43862a2c12e08795b90e6050272a65138c31c4bc109da4b3692099f1337cb9d"
     },
     {
       "path": "src/platform/win32/vds_usbip.cc",
@@ -15,7 +15,7 @@
     {
       "path": "src/platform/win32/vds_bt.cc",
       "upstreamSha256": "25bc3c10aef393bc09d6852081caa94abd786e32b07491b7f92ea54107b3fd01",
-      "patchedSha256": "439bf59e10b9b629fecffb5efbd2cab44b9bbc9d622761f1567a03826fe1b07b"
+      "patchedSha256": "b45833128442af6e7495c8533957393869790eb6e612ae7311a88c7bbea6e3f0"
     },
     {
       "path": "src/platform/win32/vds_bt.hh",
@@ -42,6 +42,10 @@
       "patchedSha256": "f4118ec4cbf5f5a61ce6d9d2e5af5d7dfb8ca7f9880666f62f3cea351c6087b0"
     },
     {
+      "path": "src/controller_preferences.hh",
+      "patchedSha256": "9619944910130baf75e76bc7f8376d644699d5a2d426adae3b05c7f978d0f972"
+    },
+    {
       "path": "src/usbip_hid_queue.hh",
       "patchedSha256": "7adb341c2a3c2faa85e0c96a8a6eb4b1749ca4a89f782e73da0a90b270e25d33"
     },
@@ -51,7 +55,7 @@
     },
     {
       "path": "src/dsbridge_runtime_tests.cc",
-      "patchedSha256": "7743796a7ce5261712957dca482bc3a51f1e9ae71141c278a4ec264e608ce8fe"
+      "patchedSha256": "b9696a06dee8dcf8f8bcc1014ef54a41d7785d90674b253ecfe0d14569174f67"
     },
     {
       "path": "src/dsbridge_diagnostic_tests.cc",

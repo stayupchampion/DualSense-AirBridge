@@ -79,7 +79,9 @@ internal sealed class HidHide : IHideAccess {
 }
 internal sealed record ProbeReport(DateTimeOffset CheckedAt, string Windows, bool Admin, bool BackendReady,
     bool HidHideInstalled, bool UsbipInstalled, Controller[] Controllers, string[] AudioOutputs,
-    string[] Blockers, string[] Notes);
+    string[] Blockers, string[] Notes) {
+    public ConnectionEvidence Connection { get; init; }=new(false,false,false,false,false,false,false,false);
+}
 internal static class Probe {
     public static async Task<ProbeReport> Read() {
         var blockers = new List<string>(); var notes = new List<string>();
@@ -90,7 +92,9 @@ internal static class Probe {
                 var r = j.RootElement;
                 backend = r.GetProperty("bridgeProtocol").GetInt32() == 1 &&
                     r.GetProperty("managedHidHide").GetBoolean() && r.GetProperty("stopEvent").GetBoolean() &&
-                    r.GetProperty("exclusiveUsbip").GetBoolean();
+                    r.GetProperty("exclusiveUsbip").GetBoolean() &&
+                    r.TryGetProperty("singleConnectionSession",out var singleSession) && singleSession.GetBoolean() &&
+                    r.TryGetProperty("controllerPreferences",out var preferences) && preferences.GetBoolean();
                 if (!backend) blockers.Add("桥接后端缺少安全会话补丁。");
             } catch (Exception ex) { blockers.Add("后端校验失败：" + ex.Message); }
         } else blockers.Add("缺少已编译的 backend/vdsd.exe。");
@@ -103,23 +107,38 @@ internal static class Probe {
             if (IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners().Any(x => x.Port == 3240))
                 blockers.Add("本机 3240 端口已被占用，不能与其他 USB/IP 桥接并用。");
         } catch (Exception ex) { blockers.Add("无法检查 USB/IP 端口：" + ex.Message); }
+        bool backendRunning=false,connectionChecked=true,virtualController=false,importedPort=false;
         foreach (var name in new[] { "vdsd", "DS4Windows", "DSX", "DualSenseX", "DualSenseY", "DualSenseClient", "reWASD" }) {
             var processes = Process.GetProcessesByName(name);
             if (processes.Length != 0) blockers.Add("检测到 " + name + " 正在运行；请先在该软件内正常退出。");
+            if(name=="vdsd")backendRunning=processes.Length!=0;
             foreach (var p in processes) p.Dispose();
         }
         using (var service = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\vdsd"))
             if (service?.GetValue("Start") is int start && start == 2)
                 blockers.Add("已有 vDS 自动启动服务，可能接管手柄。请先处理原安装；本工具不会擅自修改它。");
         Controller[] devices = [];
-        try { devices = Devices.Enumerate(); } catch (Exception ex) { blockers.Add("手柄枚举失败：" + ex.Message); }
+        try {
+            devices = Devices.Enumerate();
+            virtualController=devices.Any(x=>Devices.IsUsbipDescendant(x.InstanceId));
+            if(virtualController)blockers.Add("检测到虚拟 DualSense，不能将当前连接视为原生模式。");
+        } catch (Exception ex) { connectionChecked=false;blockers.Add("手柄枚举失败：" + ex.Message); }
+        if(usbip)try {
+            var ports=await Run.Text(Paths.Usbip,["port"]);
+            importedPort=ports.Contains("usbip://127.0.0.1:3240/1-1",StringComparison.OrdinalIgnoreCase);
+            if(importedPort)blockers.Add("本机桥接虚拟 USB 端口仍存在，请先确认并恢复所属会话。");
+        }catch(Exception ex){connectionChecked=false;blockers.Add("无法确认虚拟 USB 端口状态："+ex.Message);}
         if (!devices.Any(x => x.Transport == "蓝牙"))
             blockers.Add("未检测到可读取的蓝牙 DualSense。完成普通蓝牙配对、拔掉数据线并唤醒手柄后再检查。");
         string[] audio = [];
         try { audio = Audio.Snapshot().Defaults.Where(x => x.Flow == 0).Select(x => x.Name).Distinct().ToArray(); }
         catch (Exception ex) { blockers.Add("无法读取默认音频设备：" + ex.Message); }
+        if(audio.Length==0)blockers.Add("没有可用的默认播放设备。请先连接所需音箱或耳机并确认正常播放，再启用桥接。");
         notes.Add("《影之刃：零》尚未实机验收。优先比较同一场景的 USB 原生与蓝牙桥接效果。");
         notes.Add("不安装驱动、不注册服务、不修改开机项；本次检查为只读。");
-        return new(DateTimeOffset.Now, Environment.OSVersion.VersionString, Paths.Admin, backend, hide, usbip, devices, audio, blockers.ToArray(), notes.ToArray());
+        return new(DateTimeOffset.Now, Environment.OSVersion.VersionString, Paths.Admin, backend, hide, usbip, devices, audio, blockers.ToArray(), notes.ToArray()) {
+            Connection=new(connectionChecked,backendRunning,virtualController,importedPort,SessionWorker.Pending().Any(),
+                devices.Any(x=>x.Transport=="蓝牙"),devices.Any(x=>x.Transport=="USB"&&!Devices.IsUsbipDescendant(x.InstanceId)),audio.Length>0)
+        };
     }
 }

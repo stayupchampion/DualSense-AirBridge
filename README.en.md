@@ -28,6 +28,18 @@ It is intended for PC games with native DualSense support. **It is not a univers
 
 Built-in feedback and latency-comparison panels send identical test signals through physical USB and Bluetooth bridging. Software timings describe queues and report arrivals; **they do not measure physical end-to-end latency**.
 
+## In development: battery and speaker controls
+
+The current source also includes a **UI-only refresh**: a light grouped layout, sidebar navigation, separate diagnostics/recovery and guide pages, and consistent feedback/latency windows. Bridge lifecycle, battery reading, mute, audio protection, feedback and timing logic are unchanged. This interface is not yet released; see [UI refresh notes](docs/ui-refresh.md).
+
+These additions are in the unreleased `0.1.5-dev` source. They are **not included in the GitHub v0.1.4 assets**:
+
+- Battery and charging state refresh about every 5 seconds. Bridge mode reuses received input reports without extra controller queries. Capacity is quantized in roughly 10% bands and shown as approximate. Native mode reads one shared input report without changing reporting modes; simple Bluetooth reports may omit battery data. Missing or stale data is not shown as 0%.
+- **Controller speaker mute defaults to on.** Unchecking the option returns speaker control to the game. The preference applies only to this bridge session and resets to muted when the app opens. Haptics, adaptive triggers, microphone and headset fields are preserved; the four-channel virtual USB endpoint is never muted as a whole.
+- A read-only Windows playback-device, volume and mute display refreshes about once per second. This does not prove physical loudness. The reported Bose volume-key issue still requires a native-versus-bridge comparison and is not claimed fixed.
+
+No startup item, service or driver is added. See [controller controls](docs/controller-controls.md) for implementation, protocol sources and validation limits.
+
 ## How it works
 
 ```text

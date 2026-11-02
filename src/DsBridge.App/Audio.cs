@@ -148,7 +148,7 @@ internal static partial class Audio {
         }finally {Marshal.ReleaseComObject(e);}
     }
 
-    public static int GuardDefaults(AudioState baseline) {
+    public static int GuardDefaults(AudioState baseline,Action<AudioObservation>? observe=null) {
         var current=Observe(false);int restored=0;
         foreach(var original in baseline.Defaults) {
             var now=current.Defaults.FirstOrDefault(x=>x.Flow==original.Flow&&x.Role==original.Role);
@@ -160,6 +160,7 @@ internal static partial class Audio {
             try {Marshal.ThrowExceptionForHR(policy.SetDefaultEndpoint(original.Id,original.Role));restored++;}
             finally {Marshal.ReleaseComObject(policy);}
         }
+        observe?.Invoke(current);
         return restored;
     }
 }

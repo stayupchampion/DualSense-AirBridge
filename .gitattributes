@@ -7,6 +7,7 @@
 *.cs text eol=lf
 *.cc text eol=lf
 *.hh text eol=lf
-*.patch text eol=lf
+# Unified diff context uses a single space for otherwise empty lines.
+*.patch text eol=lf whitespace=-blank-at-eol
 *.png binary
 *.ico binary

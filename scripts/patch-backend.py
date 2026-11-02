@@ -6,6 +6,7 @@ import argparse, difflib, hashlib, json, shutil
 import backend_runtime_patch as runtime
 import backend_async_hid_patch as async_hid
 import backend_diagnostics_patch as diagnostics
+import backend_preferences_patch as preferences
 
 COMMIT = 'ec531599dfdd02e14ce68efd8c0d2dcb439894a5'
 
@@ -73,6 +74,19 @@ def patch_daemon(s):
     s = replace_once(s, '                       &stop_requested, &trace_flags);', '                       &stop_requested, &trace_flags, &ready);')
     s = replace_once(s, '  done = true;\n}', '  ready = false;\n  done = true;\n}')
     s = replace_once(s, '                                         worker_ptr->done,\n                                         worker_ptr->last_error, trace_flags);', '                                         worker_ptr->done, worker_ptr->ready,\n                                         worker_ptr->last_error, trace_flags);')
+    # A managed invocation owns exactly one user-started connection attempt.
+    # End the supervisor when that attempt finishes. Otherwise the upstream
+    # one-second retry can recreate USB/audio devices during the manager's
+    # disconnect grace period, silently taking over a reconnected controller.
+    s = replace_once(s, '''    if (worker_removed) {
+      scan_requested = true;
+    }''', '''    if (worker_removed) {
+      g_stop_requested = true;
+      SetEvent(g_stop_event);
+      logger.log(vds::LogScope::Daemon, vds::LogLevel::Info,
+                 "Managed connection ended; manual enable required");
+      break;
+    }''')
     # A/B software test: nonempty trace reply is lost when server disconnects
     # before .NET's separate Write/Read consumes buffered output. Keep the pipe
     # until client close or a bounded 5s read timeout; empty lists close at once.
@@ -82,7 +96,7 @@ def patch_daemon(s):
 // DSBridge fork: no service dispatcher and no install/self-registration path.
 int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--bridge-info") {
-    std::cout << R"({"bridgeProtocol":1,"upstreamCommit":"ec531599dfdd02e14ce68efd8c0d2dcb439894a5","managedHidHide":true,"stopEvent":true,"exclusiveUsbip":true,"serviceMode":false})" << "\n";
+    std::cout << R"({"bridgeProtocol":1,"upstreamCommit":"ec531599dfdd02e14ce68efd8c0d2dcb439894a5","managedHidHide":true,"stopEvent":true,"exclusiveUsbip":true,"serviceMode":false,"singleConnectionSession":true})" << "\n";
     return 0;
   }
   return run_windows_daemon(argc, argv, false);
@@ -128,13 +142,13 @@ def main():
     patches.mkdir(exist_ok=True)
     diffs = []
     records = []
-    for relative, patcher in [('src/platform/win32/vdsd.cc', lambda s: diagnostics.daemon(runtime.daemon(patch_daemon(s)))), ('src/platform/win32/vds_usbip.cc', lambda s: async_hid.usbip(runtime.usbip(patch_usbip(s)))), ('src/platform/win32/vds_bt.cc', lambda s: diagnostics.transport(runtime.transport(s))), ('src/platform/win32/vds_bt.hh', runtime.transport_header), ('src/vds_log.hh', diagnostics.logger_header), ('src/vds_log.cc', diagnostics.logger_source), ('CMakeLists.txt', patch_cmake)]:
+    for relative, patcher in [('src/platform/win32/vdsd.cc', lambda s: preferences.daemon(diagnostics.daemon(runtime.daemon(patch_daemon(s))))), ('src/platform/win32/vds_usbip.cc', lambda s: async_hid.usbip(runtime.usbip(patch_usbip(s)))), ('src/platform/win32/vds_bt.cc', lambda s: preferences.transport(diagnostics.transport(runtime.transport(s)))), ('src/platform/win32/vds_bt.hh', runtime.transport_header), ('src/vds_log.hh', diagnostics.logger_header), ('src/vds_log.cc', diagnostics.logger_source), ('CMakeLists.txt', patch_cmake)]:
         original = (source / relative).read_text(encoding='utf-8')
         updated = patcher(original)
         (dest / relative).write_text(updated, encoding='utf-8', newline='\n')
         diffs.extend(difflib.unified_diff(original.splitlines(True), updated.splitlines(True), fromfile='a/'+relative, tofile='b/'+relative))
         records.append({'path':relative,'upstreamSha256':hashlib.sha256(original.encode()).hexdigest(),'patchedSha256':hashlib.sha256(updated.encode()).hexdigest()})
-    for origin, relative in [('patches/bridge_runtime.hh','src/bridge_runtime.hh'), ('patches/usbip_hid_queue.hh','src/usbip_hid_queue.hh'), ('patches/diagnostic_worker.hh','src/diagnostic_worker.hh'), ('tests/backend_runtime_tests.cc','src/dsbridge_runtime_tests.cc'), ('tests/backend_diagnostic_tests.cc','src/dsbridge_diagnostic_tests.cc')]:
+    for origin, relative in [('patches/bridge_runtime.hh','src/bridge_runtime.hh'), ('patches/controller_preferences.hh','src/controller_preferences.hh'), ('patches/usbip_hid_queue.hh','src/usbip_hid_queue.hh'), ('patches/diagnostic_worker.hh','src/diagnostic_worker.hh'), ('tests/backend_runtime_tests.cc','src/dsbridge_runtime_tests.cc'), ('tests/backend_diagnostic_tests.cc','src/dsbridge_diagnostic_tests.cc')]:
         updated=(root/origin).read_text(encoding='utf-8')
         (dest/relative).write_text(updated,encoding='utf-8',newline='\n')
         diffs.extend(difflib.unified_diff([],updated.splitlines(True),fromfile='/dev/null',tofile='b/'+relative))

@@ -63,3 +63,19 @@ logs, drain/reopen and preservation of generated log schemas. Hardware acceptanc
 is separate from the 0.1.3 evidence. The 0.1.4 feedback/cancel/pulse test and
 19 recovery observations passed, with user-confirmed normal haptics, trigger and
 Bose playback. See ../docs/diagnostic-jitter-optimization.md for evidence/limits.
+
+The unreleased 0.1.5-dev candidate ends its managed supervisor after its first
+worker finishes. It does not inherit upstream's automatic one-second reconnect
+retry for a completed connection. A new physical connection requires a new
+user-started managed session; `--bridge-info` reports `singleConnectionSession`.
+This removes a retry race with the manager's disconnect grace period. It is not
+evidence that a Bluetooth speaker or radio fault has been fixed. See
+../docs/reconnect-investigation.md for current acceptance limits.
+
+The unreleased controller-controls candidate adds controller_preferences.hh and
+../scripts/backend_preferences_patch.py. It caches battery data from existing
+input, reports freshness over the private health-check pipe, and defaults the
+controller speaker to muted. A final-write filter preserves non-speaker fields
+and recomputes CRC for state, init and audio reports; the retained game state is
+re-applied when unmuting. The whole four-channel endpoint is never muted.
+See ../docs/controller-controls.md for protocol sources and hardware-test limits.

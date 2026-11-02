@@ -1,12 +1,11 @@
 ﻿using System.Diagnostics;
-using System.IO.Pipes;
 using System.Text;
 using System.Text.Json;
 using DsBridge.Core;
 
 namespace DsBridge.App;
 
-internal sealed record SessionRequest(Controller Controller,int ParentPid,long ParentStarted);
+internal sealed record SessionRequest(Controller Controller,int ParentPid,long ParentStarted,bool SpeakerMuted=true);
 internal sealed record SessionStatus(string State,string Message,int WorkerPid,long WorkerStarted,DateTimeOffset Updated);
 internal static class SessionWorker {
     static string StatusPath(string dir)=>Path.Combine(dir,"status.json");
@@ -24,20 +23,6 @@ internal static class SessionWorker {
             if(journal is null || journal.Stage!="restored") yield return dir;
         }
     }
-    static async Task<bool> Ready(string pipeName,string address) {
-        using var timeout=new CancellationTokenSource(1500);
-        using var pipe=new NamedPipeClientStream(".",pipeName,PipeDirection.InOut,PipeOptions.Asynchronous);
-        await pipe.ConnectAsync(timeout.Token);
-        await pipe.WriteAsync(Encoding.UTF8.GetBytes("{\"command\":\"list\"}\n"),timeout.Token);
-        await pipe.FlushAsync(timeout.Token);
-        using var reader=new StreamReader(pipe,new UTF8Encoding(false),false,4096,leaveOpen:true);
-        var line=await reader.ReadLineAsync(timeout.Token);
-        if(line is null) return false;
-        using var json=JsonDocument.Parse(line);
-        return json.RootElement.TryGetProperty("address",out var id) &&
-            string.Equals(id.GetString(),address,StringComparison.OrdinalIgnoreCase) &&
-            json.RootElement.TryGetProperty("connected",out var connected) && connected.GetBoolean();
-    }
     public static async Task<int> Start(string directory) {
         var dir=Paths.CheckSession(directory);
         using var mutex=new Semaphore(1,1,@"Local\DsBridge-Session");
@@ -47,6 +32,22 @@ internal static class SessionWorker {
         Journal? j=null; Process? backend=null; EventWaitHandle? stop=null; ChildJob? job=null;
         var issues=new List<string>(); var initialError="";
         var recoveryWarnings=new List<string>(); RecoveryEvidence? recoveryEvidence=null;
+        AudioTimeline? audioTimeline=null;
+        void TraceAudio(string phase,AudioObservation observation) {
+            audioTimeline?.Record(phase,observation);
+        }
+        void SaveAudioTimeline() {
+            try {
+                if(audioTimeline is not null)
+                    AtomicJson.Write(Path.Combine(dir,"audio-timeline.json"),new {
+                        Schema=1,StartupAudio=j?.Audio,Entries=audioTimeline.Entries,
+                        Scope="默认音频和启动时端点的可用性；变化时及每 30 秒在内存记录，最多 256 条，清理后保存。不录制声音，不表示实际听感或精确断连时刻。"
+                    });
+            }catch(Exception ex){
+                var warning="音频状态时间线未完整保存："+ex.Message;
+                if(!recoveryWarnings.Contains(warning))recoveryWarnings.Add(warning);
+            }
+        }
         void Save() { if(j is not null) AtomicJson.Write(Path.Combine(dir,"journal.json"),j); }
         void RecoverySave() { try { Save(); } catch(Exception ex) { issues.Add("恢复记录写入失败："+ex.Message); } }
         void RecoveryStatus(string value,string message) { try { Status(dir,value,message); } catch(Exception ex) { issues.Add("恢复状态写入失败："+ex.Message); } }
@@ -66,10 +67,36 @@ internal static class SessionWorker {
             Safety.Validate(original,selected.InstanceId);
             j=new Journal { BackendPath=Paths.Backend,InstanceId=selected.InstanceId,Address=selected.Address,
                 Original=original,Audio=Audio.Snapshot() };
+            audioTimeline=new(j.Audio);
             Save();
             var db=Path.Combine(dir,"controller.jsonl");
             File.WriteAllText(db,JsonSerializer.Serialize(new {address=selected.Address,profile="ds5",ports=new[]{0}})+"\n",new UTF8Encoding(false));
             var pipe="DsBridge-"+j.Id;
+            var desiredMute=request.SpeakerMuted;
+            BackendLiveStatus? lastControl=null;
+            var nextTelemetry=DateTime.UtcNow;
+            async Task<bool> Ready() {
+                var preferenceError="";
+                var preferences=Path.Combine(dir,"preferences.json");
+                try {
+                    if(File.Exists(preferences)) {
+                        if(new FileInfo(preferences).Length>4096)throw new InvalidDataException("设置文件过大");
+                        desiredMute=AtomicJson.Read<SpeakerPreference>(preferences).SpeakerMuted??
+                            throw new InvalidDataException("缺少静音选项");
+                    }
+                }catch(Exception ex) when(ex is IOException or JsonException or InvalidDataException or UnauthorizedAccessException) {
+                    preferenceError="未应用设置："+ex.Message;
+                }
+                var current=await BridgeControl.Query(pipe,lastControl?.SpeakerMuted==desiredMute?null:desiredMute);
+                if(DateTime.UtcNow>=nextTelemetry||lastControl?.SpeakerMuted!=current.SpeakerMuted||
+                    lastControl?.Connected!=current.Connected||preferenceError.Length>0) {
+                    BridgeControl.Save(dir,new(DateTimeOffset.UtcNow,current.Address,current.Connected,
+                        current.BatteryRaw,current.BatteryAgeMs,current.SpeakerMuted,preferenceError));
+                    nextTelemetry=DateTime.UtcNow.AddSeconds(5);
+                }
+                lastControl=current;
+                return current.Connected&&Safety.Names.Equals(current.Address,j.Address);
+            }
             var eventName=@"Local\DsBridge-"+j.Id;
             stop=new EventWaitHandle(false,EventResetMode.ManualReset,eventName,out var created);
             if(!created) throw new InvalidOperationException("会话停止事件名称冲突。");
@@ -90,12 +117,12 @@ internal static class SessionWorker {
                 if(backend.HasExited) throw new InvalidOperationException("桥接后端退出：" + await stderr);
                 if(File.Exists(Path.Combine(dir,"stop.request")) || !Run.IsAlive(request.ParentPid,request.ParentStarted))
                     throw new OperationCanceledException("已取消启动，正在恢复。");
-                if(Audio.GuardDefaults(j.Audio)>0) {
+                if(Audio.GuardDefaults(j.Audio,x=>TraceAudio("starting",x))>0) {
                     lastAudioCorrection=DateTime.UtcNow;
                     j.Notes.Add("启动期间已恢复原默认音频。"); Save();
                 }
                 bool connected=false;
-                try { connected=await Ready(pipe,j.Address); } catch(IOException) {} catch(TimeoutException) {} catch(OperationCanceledException) {}
+                try { connected=await Ready(); } catch(IOException) {} catch(TimeoutException) {} catch(OperationCanceledException) {}
                 if(connected) firstConnected??=DateTime.UtcNow; else firstConnected=null;
                 // USB audio endpoints appear after the HID handshake. Allow enumeration and
                 // default-device correction to settle before telling the user to launch a game.
@@ -110,13 +137,13 @@ internal static class SessionWorker {
             Status(dir,"active","桥接连接已建立。原生触觉、扳机与耳机并行效果仍需在游戏内验收。");
             var lastReady=DateTime.UtcNow;
             while(!File.Exists(Path.Combine(dir,"stop.request")) && Run.IsAlive(request.ParentPid,request.ParentStarted)) {
-                if(backend.HasExited) throw new InvalidOperationException("桥接进程意外退出，正在恢复原生连接。");
-                var restored=Audio.GuardDefaults(j.Audio);
+                if(backend.HasExited) throw new InvalidOperationException("桥接连接已结束，正在恢复原生连接。重新连接手柄后请手动启用桥接。");
+                var restored=Audio.GuardDefaults(j.Audio,x=>TraceAudio("active",x));
                 if(restored>0) { j.Notes.Add("已阻止新建 DualSense 端点抢占默认音频。"); Save(); }
                 var current=await hide.Read();
                 if(!current.Active || current.Inverse || !Safety.Contains(current.Devices,j.InstanceId))
                     throw new InvalidOperationException("设备隐藏配置被外部更改，桥接已停止以避免双输入。");
-                try { if(await Ready(pipe,j.Address)) lastReady=DateTime.UtcNow; } catch(IOException) {} catch(OperationCanceledException) {}
+                try { if(await Ready()) lastReady=DateTime.UtcNow; } catch(IOException) {} catch(OperationCanceledException) {}
                 if(DateTime.UtcNow-lastReady>TimeSpan.FromSeconds(5))
                     throw new InvalidOperationException("手柄连接中断，已结束本次桥接。重新连接后可手动启用。");
                 await Task.Delay(500);
@@ -127,7 +154,10 @@ internal static class SessionWorker {
             if(j is not null) {
                 j.Stage="restoring"; RecoverySave();
                 if(j.BackendPid!=0) {
-                    try {recoveryEvidence=await RecoveryDiagnostics.Begin(dir,j);}
+                    try {
+                        recoveryEvidence=await RecoveryDiagnostics.Begin(dir,j);
+                        if(recoveryEvidence.BeforeStop is not null)TraceAudio("before-stop",recoveryEvidence.BeforeStop.Audio);
+                    }
                     catch(Exception ex){recoveryWarnings.Add("停止前诊断未完成："+ex.Message);}
                 }
                 if(backend is not null && !backend.HasExited) {
@@ -153,7 +183,7 @@ internal static class SessionWorker {
                     try { issues.AddRange(await Safety.Restore(new HidHide(),j,RecoverySave)); }
                     catch(Exception ex) { issues.Add("恢复隐藏配置失败："+ex.Message); }
                 }
-                try { Audio.GuardDefaults(j.Audio); } catch(Exception ex) { recoveryWarnings.Add("无法确认默认音频恢复："+ex.Message); }
+                try { Audio.GuardDefaults(j.Audio,x=>TraceAudio("restoring",x)); } catch(Exception ex) { recoveryWarnings.Add("无法确认默认音频恢复："+ex.Message); }
                 if(j.BackendPid!=0) {
                     if(Run.IsAlive(j.BackendPid,j.BackendStarted)) issues.Add("本次后端仍在运行。");
                     try {
@@ -164,9 +194,15 @@ internal static class SessionWorker {
                 }
                 if(recoveryEvidence is not null) {
                     RecoveryStatus("restoring","配置清理已执行，正在观察原生输入与音频状态（约 5 秒）…");
-                    try {recoveryWarnings.AddRange(await RecoveryDiagnostics.Finish(recoveryEvidence,j,issues.Count==0));}
+                    try {
+                        recoveryWarnings.AddRange(await RecoveryDiagnostics.Finish(recoveryEvidence,j,issues.Count==0));
+                        if(recoveryEvidence.AfterStop.Count>0)TraceAudio("after-stop",recoveryEvidence.AfterStop[^1].Audio);
+                    }
                     catch(Exception ex){recoveryWarnings.Add("停止后诊断未完成："+ex.Message);}
                 }
+                // Persist diagnostic history only after device cleanup and observation,
+                // never ahead of default-output correction or the backend stop signal.
+                SaveAudioTimeline();
                 j.RecoveryWarnings=recoveryWarnings.Distinct().ToArray();
                 // Device-health warnings do not leave a cleanup journal pending. A user may
                 // intentionally power off the controller or change their audio device.
